@@ -344,6 +344,45 @@ mod native {
         }
     }
 
+    /// Build a machine whose guest RAM lives in a `WasmtimeBackend`'s linear memory.
+    ///
+    /// Returns the backend alongside the machine because it owns that memory:
+    /// dropping it would invalidate the pointer the machine's RAM is built on.
+    fn build_machine_on_jit_ram(
+        cfg: MachineConfig,
+    ) -> Result<(
+        Machine,
+        std::rc::Rc<
+            std::cell::RefCell<
+                aero_jit_x86::backend::WasmtimeBackend<aero_cpu_core::state::CpuState>,
+            >,
+        >,
+    )> {
+        use aero_machine::jit_ram::{WasmGuestRam, RAM_BASE};
+
+        let ram_bytes = cfg.ram_size_bytes;
+        let total = RAM_BASE
+            .checked_add(ram_bytes)
+            .ok_or_else(|| anyhow!("guest RAM too large for a wasm32 linear memory"))?;
+        let pages = total.div_ceil(65_536);
+        let pages = u32::try_from(pages)
+            .map_err(|_| anyhow!("guest RAM needs {pages} wasm pages, more than wasm32 allows"))?;
+
+        let backend = std::rc::Rc::new(std::cell::RefCell::new(
+            aero_jit_x86::backend::WasmtimeBackend::new_with_memory_pages(pages, 0x100),
+        ));
+        let ram = WasmGuestRam::new(backend.clone(), ram_bytes).ok_or_else(|| {
+            anyhow!("backend linear memory too small for {ram_bytes} bytes of RAM")
+        })?;
+        eprintln!(
+            "AERO_JIT_RAM: guest RAM is wasm linear memory ({pages} pages, ram_base={RAM_BASE:#x})"
+        );
+
+        let machine =
+            Machine::new_with_guest_memory(cfg, Box::new(ram)).map_err(|e| anyhow!("{e}"))?;
+        Ok((machine, backend))
+    }
+
     pub fn main() -> Result<()> {
         let args = Args::parse();
 
@@ -380,6 +419,9 @@ mod native {
         //
         // `AERO_LEGACY_VGA=1` forces the standalone VGA path for diagnosis when
         // resuming snapshots that were captured under `enable_vga=true`.
+        // Set when guest RAM is in the JIT's linear memory *and* compiled execution
+        // is enabled; the tier shares the backend that owns that memory.
+        let mut compiled_tier: Option<aero_machine::compiled_tier::NativeCompiledTier> = None;
         let mut machine = if std::env::var_os("AERO_LEGACY_VGA").is_some() {
             eprintln!("AERO_LEGACY_VGA: using MachineConfig::win7_storage (standalone VGA)");
             Machine::new(MachineConfig::win7_storage(ram_bytes)).map_err(|e| anyhow!("{e}"))?
@@ -389,7 +431,27 @@ mod native {
                     "AERO_AEROGPU_STDVGA_IDS: AeroGPU 00:07.0 reports Bochs Standard VGA 1234:1111 identity/topology"
                 );
             }
-            Machine::new(MachineConfig::win7_graphics(ram_bytes)).map_err(|e| anyhow!("{e}"))?
+            let cfg = MachineConfig::win7_graphics(ram_bytes);
+            if std::env::var_os("AERO_JIT_RAM").is_some() {
+                // Put guest RAM inside the JIT's WASM linear memory. Compiled Tier-1
+                // blocks address RAM as linear-memory offsets, so this is what lets a
+                // guest load become a load *inside* the compiled block rather than a
+                // call back out to the host. Nothing executes compiled code yet: this
+                // establishes that the machine runs unchanged on that backing.
+                let (machine, backend) =
+                    build_machine_on_jit_ram(cfg).map_err(|e| anyhow!("{e}"))?;
+                // The backend owns the linear memory the machine's RAM points into,
+                // so it has to outlive the machine. Hand it to the compiled tier
+                // when that is enabled, and otherwise keep it alive here.
+                if std::env::var_os("AERO_COMPILED_TIER").is_some() {
+                    compiled_tier = Some(aero_machine::compiled_tier::CompiledTier::new(backend));
+                } else {
+                    std::mem::forget(backend);
+                }
+                machine
+            } else {
+                Machine::new(cfg).map_err(|e| anyhow!("{e}"))?
+            }
         };
 
         // Record the host's chosen disk paths in the machine's snapshot overlay refs so snapshots
@@ -1105,7 +1167,9 @@ mod native {
                     break;
                 }
                 let budget = (max_insts - total_executed).min(SLICE_INST_BUDGET);
-                if args.jit {
+                if let Some(tier) = compiled_tier.as_mut() {
+                    machine.run_slice_compiled(budget, tier)
+                } else if args.jit {
                     machine.run_slice_jit(budget, &mut ir_jit)
                 } else {
                     machine.run_slice(budget)
@@ -1117,7 +1181,9 @@ mod native {
                 if start.elapsed() >= Duration::from_millis(max_ms) {
                     break;
                 }
-                if args.jit {
+                if let Some(tier) = compiled_tier.as_mut() {
+                    machine.run_slice_compiled(SLICE_INST_BUDGET, tier)
+                } else if args.jit {
                     machine.run_slice_jit(SLICE_INST_BUDGET, &mut ir_jit)
                 } else {
                     machine.run_slice(SLICE_INST_BUDGET)
@@ -1213,12 +1279,218 @@ mod native {
             }
         }
 
+        if std::env::var_os("AERO_FINAL_STATE").is_some() {
+            let s = machine.cpu();
+            eprintln!(
+                "AERO_FINAL: executed={total_executed} rip={:#x} rsp={:#x} rax={:#x} rbx={:#x} rcx={:#x} rdx={:#x} cr3={:#x}",
+                s.rip(),
+                s.read_gpr64(aero_cpu_core::state::gpr::RSP),
+                s.read_gpr64(aero_cpu_core::state::gpr::RAX),
+                s.read_gpr64(aero_cpu_core::state::gpr::RBX),
+                s.read_gpr64(aero_cpu_core::state::gpr::RCX),
+                s.read_gpr64(aero_cpu_core::state::gpr::RDX),
+                s.control.cr3,
+            );
+        }
+        if let Some(tier) = compiled_tier.as_ref() {
+            eprintln!(
+                "AERO_CT_STATS: compiled_blocks={} executed_blocks={} executed_guest_instructions={}",
+                tier.compiled_blocks(),
+                tier.executed_blocks(),
+                tier.executed_guest_instructions()
+            );
+            eprintln!(
+                "AERO_CT_CHAINS: {} chains, {:.2} blocks each, {} with no budget to chain",
+                tier.chains(),
+                if tier.chains() == 0 {
+                    0.0
+                } else {
+                    tier.executed_blocks() as f64 / tier.chains() as f64
+                },
+                tier.chains_no_budget()
+            );
+            if let Some((both, to_promoted, total)) = tier.promoted_edge_share() {
+                eprintln!(
+                    "AERO_CT_PROMOTED_EDGES: {:.1}% of steps land on a promoted block, \
+                     {:.1}% run promoted-to-promoted (of {total} recorded)",
+                    100.0 * to_promoted as f64 / total as f64,
+                    100.0 * both as f64 / total as f64
+                );
+            }
+            let (hits, misses) = tier.module_cache_stats();
+            if hits + misses > 0 {
+                eprintln!(
+                    "AERO_CT_MODULE_CACHE: {hits} modules loaded, {misses} compiled ({:.1}% reused)",
+                    100.0 * hits as f64 / (hits + misses) as f64
+                );
+            }
+            {
+                let (h, m) = tier.promote_cache_stats();
+                if h + m > 0 {
+                    eprintln!(
+                        "AERO_CT_PROMOTE_CACHE: {h} promoted modules loaded, {m} compiled ({:.1}% reused)",
+                        100.0 * h as f64 / (h + m) as f64
+                    );
+                }
+            }
+            {
+                let misses = aero_jit_x86::backend::JIT_TLB_MISSES
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                let flushes = aero_jit_x86::backend::JIT_TLB_FLUSHES
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                eprintln!(
+                    "AERO_CT_TLB: {misses} misses ({:.3}/guest insn), {flushes} full flushes \
+                     (one per {:.0} guest insns, {:.1} misses each)",
+                    misses as f64 / tier.executed_guest_instructions().max(1) as f64,
+                    tier.executed_guest_instructions() as f64 / flushes.max(1) as f64,
+                    misses as f64 / flushes.max(1) as f64
+                );
+            }
+            {
+                let k = tier.end_kinds();
+                let total: u64 = k.iter().sum();
+                eprintln!(
+                    "AERO_CT_END_KIND: jmp={} jcc={} call={} ret={} exit={} limit={} \
+                     (jmp is {:.1}% of {total} admitted)",
+                    k[0],
+                    k[1],
+                    k[2],
+                    k[3],
+                    k[4],
+                    k[5],
+                    100.0 * k[0] as f64 / total.max(1) as f64
+                );
+            }
+            if tier.jmp_block_steps() > 0 {
+                eprintln!(
+                    "AERO_CT_JMP_WEIGHT: {} of {} recorded chain steps enter a block \
+                     that ends at an unconditional jump ({:.1}%)",
+                    tier.jmp_block_steps(),
+                    tier.recorded_chain_steps(),
+                    100.0 * tier.jmp_block_steps() as f64 / tier.recorded_chain_steps().max(1) as f64
+                );
+            }
+            let chained = tier.wasm_chain_steps();
+            eprintln!(
+                "AERO_CT_WASM_CHAIN: {chained} of {} block entries taken inside wasm ({:.1}%)",
+                tier.executed_blocks(),
+                if tier.executed_blocks() == 0 {
+                    0.0
+                } else {
+                    100.0 * chained as f64 / tier.executed_blocks() as f64
+                }
+            );
+            eprintln!(
+                "AERO_CT_COST: {:.1} ns per compiled guest insn, {:.1} us per block admitted",
+                tier.ns_per_executed_insn(),
+                tier.us_per_compile()
+            );
+            eprintln!(
+                "AERO_CT_FLAGS: {} dead flag writes dropped",
+                tier.flag_writes_dropped()
+            );
+            let (empty, bails, cap, misses) = tier.rejection_counts();
+            eprintln!(
+                "AERO_CT_REJECT: empty={empty} bails_to_interp={bails} at_cap={cap} slow_mem={} chain_misses={misses}",
+                tier.rejected_slow_mem()
+            );
+            let (edge_total, edge_top, edge_blocks) = tier.edge_concentration();
+            if edge_total > 0 {
+                eprintln!(
+                    "AERO_CT_EDGES: {edge_total} transitions from {edge_blocks} blocks; {edge_top} ({:.1}%) went to the block's most frequent successor",
+                    100.0 * edge_top as f64 / edge_total as f64
+                );
+            }
+            if edge_total > 0 {
+                let (hot, backward) = tier.hot_edge_direction();
+                eprintln!(
+                    "AERO_CT_EDGE_DIR: of {hot} hot-edge transitions, {backward} ({:.1}%) go backwards",
+                    100.0 * backward as f64 / hot.max(1) as f64
+                );
+                let (cond_hot, ft) = tier.hot_edge_is_fallthrough();
+                if cond_hot > 0 {
+                    eprintln!(
+                        "AERO_CT_EDGE_FT: of {cond_hot} hot-edge transitions out of conditional blocks, {ft} ({:.1}%) are the fall-through",
+                        100.0 * ft as f64 / cond_hot as f64
+                    );
+                }
+            }
+            let (offered, dev, dun) = tier.seam_counts();
+            eprintln!(
+                "AERO_CT_SEAM: offered={offered} declined_event={dev} declined_uncompiled={dun} ran={}",
+                offered - dev - dun
+            );
+            let (rejected_offers, busiest) = tier.rejected_offer_counts();
+            // Counted over seam offers *and* chain steps — every time execution
+            // wanted this block and could not have it — so it is not a subset of
+            // the seam's decline count.
+            eprintln!("AERO_CT_WALL: {rejected_offers} wanted executions of blocks Tier-1 refused");
+            if let Some((total, blocks, shares)) = tier.execution_concentration() {
+                eprintln!("AERO_CT_HOTNESS: {total} chain-step executions across {blocks} blocks");
+                for (take, pct) in shares {
+                    eprintln!("AERO_CT_HOTNESS_TOP: busiest {take} blocks cover {pct:.1}%");
+                }
+            }
+            eprintln!(
+                "AERO_CT_FOOTPRINT: {:.1} MiB of WASM emitted for {} blocks ({} bytes each)",
+                tier.wasm_bytes() as f64 / (1024.0 * 1024.0),
+                tier.compiled_blocks(),
+                tier.wasm_bytes() / tier.compiled_blocks().max(1)
+            );
+            for (bytes, n) in aero_machine::compiled_tier::assist_histogram() {
+                eprintln!("AERO_CT_ASSIST_TOP: {bytes} x{n}");
+            }
+            eprintln!(
+                "AERO_CT_ASSISTS: {} instructions performed by the host inside a block, in {} blocks",
+                tier.assists(),
+                tier.blocks_with_assists()
+            );
+            if tier.stepped_over() > 0 {
+                eprintln!(
+                    "AERO_CT_STEPPED: {} guest instructions stepped over to get past a refusal",
+                    tier.stepped_over()
+                );
+            }
+            let (promotions, us) = tier.promotion_counts();
+            if promotions > 0 {
+                eprintln!(
+                    "AERO_CT_TIERUP: {promotions} blocks recompiled by Cranelift, {us:.1} us each"
+                );
+            }
+            let (sites, hits) = tier.resume_counts();
+            if sites > 0 {
+                eprintln!(
+                    "AERO_CT_RESUME: {sites} resume points armed, {hits} reached ({:.1}%)",
+                    100.0 * hits as f64 / sites as f64
+                );
+            }
+            let (steps, same) = tier.chain_locality();
+            if steps > 0 {
+                eprintln!(
+                    "AERO_CT_LOCALITY: {same} of {steps} chain steps ({:.1}%) stay inside one module",
+                    100.0 * same as f64 / steps as f64
+                );
+            }
+            for (bytes, n) in busiest {
+                eprintln!("AERO_CT_WALL_TOP: {bytes} x{n}");
+            }
+            eprintln!(
+                "AERO_CT_LOOPS: self_loop_steps={} of {} block executions",
+                tier.self_loop_steps(),
+                tier.executed_blocks()
+            );
+            for (name, n) in tier.bail_mnemonics().into_iter().take(12) {
+                eprintln!("AERO_CT_BAIL: {name} x{n}");
+            }
+        }
         if args.jit {
             eprintln!(
-                "AERO_JIT_STATS: cached_blocks={} executed_blocks={} executed_guest_instructions={}",
+                "AERO_JIT_STATS: cached_blocks={} executed_blocks={} executed_guest_instructions={} memory_free_blocks={} memory_free_insts={}",
                 ir_jit.len(),
                 ir_jit.executed_blocks(),
-                ir_jit.executed_guest_instructions()
+                ir_jit.executed_guest_instructions(),
+                ir_jit.memory_free_blocks(),
+                ir_jit.memory_free_insts()
             );
         }
 

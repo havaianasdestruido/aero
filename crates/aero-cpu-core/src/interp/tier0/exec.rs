@@ -227,8 +227,18 @@ struct DecodeCache {
 #[inline]
 fn decode_key(bytes: &[u8]) -> u128 {
     let mut padded = [0u8; 16];
-    let len = bytes.len().min(15);
-    padded[..len].copy_from_slice(&bytes[..len]);
+    // Copy a *constant* 15 bytes on the path that almost always runs. The
+    // variable-length form compiles to a `memcpy` call, and at one call per
+    // decoded instruction that showed up as a libc `memmove` inside the
+    // interpreter's hot loop. A fixed-size copy is two loads and two stores
+    // inline.
+    if bytes.len() >= 15 {
+        let head: &[u8; 15] = bytes[..15].try_into().expect("length checked");
+        padded[..15].copy_from_slice(head);
+    } else {
+        let len = bytes.len();
+        padded[..len].copy_from_slice(&bytes[..len]);
+    }
     u128::from_le_bytes(padded)
 }
 
@@ -243,6 +253,22 @@ const fn prefix_mask(n: u32) -> u128 {
 
 const PREFIX_MASK_6: u128 = prefix_mask(6);
 const PREFIX_MASK_8: u128 = prefix_mask(8);
+
+/// `prefix_mask` for every instruction length, indexed by byte count.
+///
+/// The obvious `(1u128 << (len * 8)) - 1` has a *runtime* shift amount, and a
+/// 128-bit variable shift lowers to a `shrd` pair plus branches. That ran on every
+/// decode-cache probe — once per instruction — and a single `shrd` was over 6% of
+/// the interpreter's hot loop. Indexing a table is one load.
+const PREFIX_MASKS: [u128; 16] = {
+    let mut masks = [0u128; 16];
+    let mut i = 0usize;
+    while i < 16 {
+        masks[i] = prefix_mask(i as u32);
+        i += 1;
+    }
+    masks
+};
 
 impl DecodeCache {
     fn new() -> Self {
@@ -261,7 +287,13 @@ impl DecodeCache {
     }
 
     #[inline]
-    fn slot_matches(slot: &DecodeCacheSlot, ip: u64, bitness: u32, key: u128, avail: usize) -> bool {
+    fn slot_matches(
+        slot: &DecodeCacheSlot,
+        ip: u64,
+        bitness: u32,
+        key: u128,
+        avail: usize,
+    ) -> bool {
         let len = usize::from(slot.decoded.len);
         if slot.ip != ip || slot.bitness != bitness || len > avail {
             return false;
@@ -271,7 +303,7 @@ impl DecodeCache {
         let mask = if len >= 16 {
             u128::MAX
         } else {
-            (1u128 << (len * 8)) - 1
+            PREFIX_MASKS[len]
         };
         (slot.key ^ key) & mask == 0
     }
@@ -2131,8 +2163,7 @@ const BCRYPT_SHA512_COMPRESS_PREFIX: [u8; 32] = [
 ];
 const BCRYPT_SHA512_COMPRESS_INSNS: u64 = 64;
 /// The first 15 bytes of the compress prologue, packed for the batch loop's gate.
-const BCRYPT_SHA512_COMPRESS_KEY: u128 =
-    packed_prefix(&BCRYPT_SHA512_COMPRESS_PREFIX, 15);
+const BCRYPT_SHA512_COMPRESS_KEY: u128 = packed_prefix(&BCRYPT_SHA512_COMPRESS_PREFIX, 15);
 
 /// Pack the first `n` bytes of a fuse signature the same way [`decode_key`] packs
 /// a live decode window.
@@ -2225,7 +2256,8 @@ fn match_bcrypt_sha512_compress<B: CpuBus>(
         }
         return true;
     }
-    let Some(bytes) = collect_code_window(cpu, bus, ip, already, BCRYPT_SHA512_COMPRESS_PREFIX.len())
+    let Some(bytes) =
+        collect_code_window(cpu, bus, ip, already, BCRYPT_SHA512_COMPRESS_PREFIX.len())
     else {
         return false;
     };
@@ -2277,7 +2309,8 @@ fn exec_bcrypt_sha512_compress<B: CpuBus>(
         .map_err(|e| (ip, e))?;
     cpu.state.write_reg(Register::RSP, rsp.wrapping_add(8));
     cpu.state.set_rip(ret);
-    cpu.pending.retire_instructions(BCRYPT_SHA512_COMPRESS_INSNS);
+    cpu.pending
+        .retire_instructions(BCRYPT_SHA512_COMPRESS_INSNS);
     cpu.time.advance_cycles(BCRYPT_SHA512_COMPRESS_INSNS);
     cpu.state.msr.tsc = cpu.time.read_tsc();
     Ok(BCRYPT_SHA512_COMPRESS_INSNS)
@@ -2309,15 +2342,10 @@ const WIN7_KTHREAD_RUNNING_SPIN: [u8; 6] = [0xF3, 0x90, 0x80, 0x7E, 0x49, 0x00];
 const WIN7_KTHREAD_RUNNING_SPIN_KEY: u128 = packed_prefix(&WIN7_KTHREAD_RUNNING_SPIN, 6);
 /// Live tail after the 6-byte prefix at ntos `0xfffff800026eb41e`:
 /// `je rel32` (exit) + `jmp rel8` (back to pause).
-const WIN7_KTHREAD_RUNNING_SPIN_JE_JMP: [u8; 8] =
-    [0x0F, 0x84, 0xE1, 0xFC, 0xFF, 0xFF, 0xEB, 0xF2];
+const WIN7_KTHREAD_RUNNING_SPIN_JE_JMP: [u8; 8] = [0x0F, 0x84, 0xE1, 0xFC, 0xFF, 0xFF, 0xEB, 0xF2];
 const WIN7_KTHREAD_RUNNING_SPIN_INSNS: u64 = 4; // pause, cmp, je, jmp
 
-fn kthread_running_is_current<B: CpuBus>(
-    cpu: &interrupts::CpuCore,
-    bus: &mut B,
-    rsi: u64,
-) -> bool {
+fn kthread_running_is_current<B: CpuBus>(cpu: &interrupts::CpuCore, bus: &mut B, rsi: u64) -> bool {
     let gs = cpu.state.msr.gs_base;
     if gs <= 0xffff_8000_0000_0000 {
         return false;
@@ -2402,7 +2430,8 @@ fn match_kernelbase_nls_upcase<B: CpuBus>(
     ip: u64,
     already: &[u8],
 ) -> bool {
-    let Some(bytes) = collect_code_window(cpu, bus, ip, already, KERNELBASE_NLS_UPCASE.len()) else {
+    let Some(bytes) = collect_code_window(cpu, bus, ip, already, KERNELBASE_NLS_UPCASE.len())
+    else {
         return false;
     };
     bytes.as_slice() == KERNELBASE_NLS_UPCASE
@@ -2978,12 +3007,114 @@ fn prefix_eq<B: CpuBus>(
     Ok(a2 as u64 == b2)
 }
 
+/// A caller-supplied hook offered each Tier-0 basic-block boundary.
+///
+/// `Machine::run_slice` runs Tier-0 with `exit_on_branch: false`, because ending
+/// the batch on every branch forces a device re-poll and paging-bus rebuild that
+/// costs far more than the branch itself. The consequence is that the caller sees
+/// exactly one RIP per batch — whichever the instruction budget expired at — so a
+/// compiled block is entered only if the budget happens to land on its entry. At a
+/// few hundred instructions of coverage per batch that caps a compiled tier well
+/// below what it is worth.
+///
+/// Deliberately **not** generic. Making the batch generic over a hook type gives it
+/// a second monomorphisation, and that alone measured as a 4% regression on the
+/// untiered path even with the hook compiled away. A pointer and a function pointer
+/// keep one body and cost one predictable branch per taken branch.
+///
+/// The context pointer is opaque here; only the callback that was built alongside
+/// it ever interprets it.
+pub struct Tier0BranchSeam {
+    ctx: *mut (),
+    /// Called at a taken branch. Returns how many guest instructions it executed,
+    /// having already advanced RIP, retirement and the time source for them; 0
+    /// means it did nothing and Tier-0 should carry on.
+    ///
+    /// The CPU and bus are handed over as arguments rather than captured, because
+    /// the batch holds `&mut` to both for its whole duration — a seam that captured
+    /// them would alias those borrows. The bus arrives type-erased for the same
+    /// reason the seam is not generic; the callback was built knowing its type.
+    run: fn(
+        ctx: *mut (),
+        cpu: &mut interrupts::CpuCore,
+        bus: *mut (),
+        assist: *mut AssistContext,
+        budget: u64,
+    ) -> u64,
+    /// How many more instructions to run before offering the tier again, outside a
+    /// taken branch. Zero means never.
+    ///
+    /// The seam is otherwise only offered at taken branches, so when a chain stops
+    /// because the tier refused a block the interpreter carries on to the next
+    /// branch — about thirteen instructions, every time, and that is most of what
+    /// the compiled tier still spends on interpretation. The tier sets this to 1
+    /// when a chain stops somewhere it refused, meaning "step over that instruction
+    /// and hand back". A count rather than a RIP because the length of an
+    /// instruction Tier-1 could not decode is exactly what is not known.
+    resume_in: std::rc::Rc<std::cell::Cell<u64>>,
+}
+
+impl Tier0BranchSeam {
+    /// `ctx` is passed back to `run` unchanged. The caller is responsible for it
+    /// outliving this seam.
+    pub fn new(
+        ctx: *mut (),
+        run: fn(
+            ctx: *mut (),
+            cpu: &mut interrupts::CpuCore,
+            bus: *mut (),
+            assist: *mut AssistContext,
+            budget: u64,
+        ) -> u64,
+        resume_in: std::rc::Rc<std::cell::Cell<u64>>,
+    ) -> Self {
+        Self {
+            ctx,
+            run,
+            resume_in,
+        }
+    }
+
+    #[inline]
+    fn offer(
+        &mut self,
+        cpu: &mut interrupts::CpuCore,
+        bus: *mut (),
+        assist: *mut AssistContext,
+        budget: u64,
+    ) -> u64 {
+        (self.run)(self.ctx, cpu, bus, assist, budget)
+    }
+
+    /// Instructions left before the tier is offered again outside a branch.
+    #[inline]
+    fn resume_in(&self) -> u64 {
+        self.resume_in.get()
+    }
+
+    #[inline]
+    fn set_resume_in(&self, n: u64) {
+        self.resume_in.set(n);
+    }
+}
+
 pub fn run_batch_cpu_core_with_assists<B: CpuBus>(
     cfg: &Tier0Config,
     ctx: &mut AssistContext,
     cpu: &mut interrupts::CpuCore,
     bus: &mut B,
     max_insts: u64,
+) -> BatchResult {
+    run_batch_cpu_core_with_assists_seamed(cfg, ctx, cpu, bus, max_insts, None)
+}
+
+pub fn run_batch_cpu_core_with_assists_seamed<B: CpuBus>(
+    cfg: &Tier0Config,
+    ctx: &mut AssistContext,
+    cpu: &mut interrupts::CpuCore,
+    bus: &mut B,
+    max_insts: u64,
+    mut seam: Option<&mut Tier0BranchSeam>,
 ) -> BatchResult {
     use aero_x86::{Mnemonic, OpKind};
 
@@ -3037,6 +3168,35 @@ pub fn run_batch_cpu_core_with_assists<B: CpuBus>(
                 executed,
                 exit: BatchExit::Halted,
             };
+        }
+
+        // The one place the tier is offered outside a taken branch. It asked to be
+        // handed back once the instruction it could not translate has been stepped
+        // over, rather than after the interpreter has run on to the next branch.
+        if let Some(seam) = seam.as_deref_mut() {
+            let left = seam.resume_in();
+            if left > 0 {
+                seam.set_resume_in(left - 1);
+                if left == 1 {
+                    let budget = max_insts.saturating_sub(executed);
+                    if budget > 0 {
+                        let erased = bus as *mut B as *mut ();
+                        // Release the decode cache across the offer. It is held for
+                        // the whole batch to keep a TLS access and a `RefCell` borrow
+                        // off the per-instruction path, but the compiled tier may
+                        // step an instruction of its own through here, and that needs
+                        // the cache too. An offer happens about once in two hundred
+                        // instructions, so re-taking it is not on any hot path.
+                        drop(cache);
+                        let ran = seam.offer(cpu, erased, ctx as *mut AssistContext, budget);
+                        cache = cell.borrow_mut();
+                        if ran > 0 {
+                            executed = executed.saturating_add(ran);
+                            continue;
+                        }
+                    }
+                }
+            }
         }
 
         bus.sync(&cpu.state);
@@ -3392,6 +3552,18 @@ pub fn run_batch_cpu_core_with_assists<B: CpuBus>(
                         exit: BatchExit::Branch,
                     };
                 }
+                // Block boundary: RIP is the branch target.
+                if let Some(seam) = seam.as_deref_mut() {
+                    let budget = max_insts.saturating_sub(executed);
+                    if budget > 0 {
+                        let erased = bus as *mut B as *mut ();
+                        // See the note at the resume-point offer above.
+                        drop(cache);
+                        let ran = seam.offer(cpu, erased, ctx as *mut AssistContext, budget);
+                        cache = cell.borrow_mut();
+                        executed = executed.saturating_add(ran);
+                    }
+                }
             }
             ExecOutcome::Halt => {
                 cpu.state.set_rip(next_ip);
@@ -3518,6 +3690,27 @@ pub fn run_batch_cpu_core_with_assists<B: CpuBus>(
                         executed,
                         exit: BatchExit::Branch,
                     };
+                }
+
+                // An assist is where a compiled block gave up. Offer the seam here as
+                // well as at branches: RIP is now the instruction *after* the one the
+                // compiled tier could not translate, which is exactly where it could
+                // start again. Without this the interpreter carries on to the next
+                // taken branch — about thirteen instructions each time, and the
+                // instructions a compiled tier does not cover are what its remaining
+                // cost is mostly made of.
+                if seam_after_assist() {
+                  if let Some(seam) = seam.as_deref_mut() {
+                    let budget = max_insts.saturating_sub(executed);
+                    if budget > 0 {
+                        let erased = bus as *mut B as *mut ();
+                        // See the note at the resume-point offer above.
+                        drop(cache);
+                        let ran = seam.offer(cpu, erased, ctx as *mut AssistContext, budget);
+                        cache = cell.borrow_mut();
+                        executed = executed.saturating_add(ran);
+                    }
+                  }
                 }
             }
         }
@@ -3700,5 +3893,24 @@ mod lzx_bit_refill_match_tests {
         assert_eq!(spec.bits, Register::EBX);
         assert_eq!(spec.bitcount, Register::DIL);
         assert_eq!(spec.fallthrough, 0x1000 + VERBATIM.len() as u64);
+    }
+}
+
+/// Whether the compiled tier is offered the instruction after an assist.
+///
+/// See the call site. Off, and measured: the idea is right — the instruction after
+/// the one a compiled block could not translate is exactly where it could start
+/// again — but the points are diverse and mostly cold, so it admits blocks that do
+/// not repay their compilation. 187.4 against 184.4 host instructions per guest
+/// instruction. `AERO_CT_SEAM_AFTER_ASSIST=1` turns it on.
+fn seam_after_assist() -> bool {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        return *ON.get_or_init(|| std::env::var_os("AERO_CT_SEAM_AFTER_ASSIST").is_some());
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        false
     }
 }

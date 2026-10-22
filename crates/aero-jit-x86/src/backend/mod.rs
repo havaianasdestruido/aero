@@ -42,9 +42,12 @@ impl Tier1Cpu for CoreCpuState {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+pub mod shared_memory;
 mod wasmtime;
 
-pub use wasmtime::{WasmtimeBackend, WriteObserver};
+pub use crate::compiled_backend::{CompiledBackend, GuestAccessor, GuestTranslator};
+pub use wasmtime::{WasmtimeBackend, WriteObserver, JIT_TLB_FLUSHES, JIT_TLB_MISSES};
 
 /// A cloneable handle around [`WasmtimeBackend`] so compilation workers can add table entries while
 /// the [`JitRuntime`] owns a copy of the backend.
@@ -186,5 +189,185 @@ mod tests {
         });
         assert_eq!(file, expected_file);
         assert_eq!(line, expected_line);
+    }
+}
+
+impl CompiledBackend for WasmtimeBackend<aero_cpu_core::state::CpuState> {
+    fn add_block(&mut self, wasm: &[u8]) -> u32 {
+        self.add_compiled_block(wasm)
+    }
+
+    fn add_blocks(&mut self, wasm: &[u8], count: usize) -> Vec<u32> {
+        self.add_compiled_blocks(wasm, count)
+    }
+
+    fn add_dispatched_blocks(&mut self, wasm: &[u8], count: usize) -> Vec<u32> {
+        WasmtimeBackend::add_dispatched_blocks(self, wasm, count)
+    }
+
+    fn can_optimize(&self) -> bool {
+        WasmtimeBackend::can_optimize(self)
+    }
+
+    fn promote_block(&mut self, table_index: u32, wasm: &[u8]) -> bool {
+        WasmtimeBackend::promote_block(self, table_index, wasm)
+    }
+
+    fn promote_blocks(&mut self, table_indices: &[u32], wasm: &[u8]) -> usize {
+        WasmtimeBackend::promote_blocks(self, table_indices, wasm)
+    }
+
+    fn promote_blocks_replacing(&mut self, table_indices: &[u32], wasm: &[u8]) -> usize {
+        WasmtimeBackend::promote_blocks_replacing(self, table_indices, wasm)
+    }
+
+    fn compiles_async(&self) -> bool {
+        WasmtimeBackend::compiles_in_flight(self) < usize::MAX
+            && WasmtimeBackend::has_compile_workers(self)
+    }
+
+    fn submit_dispatched_blocks(&mut self, wasm: Vec<u8>, count: usize) -> Option<u64> {
+        WasmtimeBackend::submit_dispatched_blocks(self, wasm, count)
+    }
+
+    fn take_dispatched_blocks(&mut self, id: u64) -> Option<Vec<u32>> {
+        WasmtimeBackend::take_dispatched_blocks(self, id)
+    }
+
+    fn poll_dispatched_blocks(&mut self) -> Vec<(u64, Vec<u32>)> {
+        WasmtimeBackend::poll_dispatched_blocks(self)
+    }
+
+    fn can_cache_modules(&self) -> bool {
+        true
+    }
+
+    fn add_dispatched_blocks_serialized(
+        &mut self,
+        wasm: &[u8],
+        count: usize,
+    ) -> (Vec<u32>, Option<Vec<u8>>) {
+        WasmtimeBackend::add_dispatched_blocks_serialized(self, wasm, count)
+    }
+
+    unsafe fn add_dispatched_precompiled(
+        &mut self,
+        bytes: &[u8],
+        count: usize,
+    ) -> Option<Vec<u32>> {
+        // Safety: forwarded from the trait's contract.
+        unsafe { WasmtimeBackend::add_dispatched_precompiled(self, bytes, count) }
+    }
+
+    fn compiles_in_flight(&self) -> usize {
+        WasmtimeBackend::compiles_in_flight(self)
+    }
+
+    fn promote_blocks_serialized(
+        &mut self,
+        table_indices: &[u32],
+        wasm: &[u8],
+    ) -> (usize, Option<Vec<u8>>) {
+        WasmtimeBackend::promote_blocks_serialized(self, table_indices, wasm)
+    }
+
+    unsafe fn promote_blocks_precompiled(
+        &mut self,
+        table_indices: &[u32],
+        bytes: &[u8],
+    ) -> Option<usize> {
+        // Safety: forwarded from the trait's contract.
+        unsafe { WasmtimeBackend::promote_blocks_precompiled(self, table_indices, bytes) }
+    }
+
+    fn promote_blocks_replacing_serialized(
+        &mut self,
+        table_indices: &[u32],
+        wasm: &[u8],
+    ) -> (usize, Option<Vec<u8>>) {
+        WasmtimeBackend::promote_blocks_replacing_serialized(self, table_indices, wasm)
+    }
+
+    unsafe fn promote_blocks_replacing_precompiled(
+        &mut self,
+        table_indices: &[u32],
+        bytes: &[u8],
+    ) -> Option<usize> {
+        // Safety: forwarded from the trait's contract.
+        unsafe {
+            WasmtimeBackend::promote_blocks_replacing_precompiled(self, table_indices, bytes)
+        }
+    }
+
+    fn can_chain_in_wasm(&self) -> bool {
+        true
+    }
+
+    fn chain_map_insert(&mut self, rip: u64, module_id: u32, index: u32) {
+        WasmtimeBackend::chain_map_insert(self, rip, module_id, index);
+    }
+
+    fn chain_map_forget(&mut self, rip: u64) {
+        WasmtimeBackend::chain_map_forget(self, rip);
+    }
+
+    fn chain_map_clear(&mut self) {
+        WasmtimeBackend::chain_map_clear(self);
+    }
+
+    fn wasm_chain_steps(&self) -> u64 {
+        WasmtimeBackend::wasm_chain_steps(self)
+    }
+
+    fn set_chain_limits(&mut self, retired_budget: u64, max_blocks: u32) {
+        WasmtimeBackend::set_chain_limits(self, retired_budget, max_blocks);
+    }
+
+    fn set_clock(
+        &mut self,
+        clock: Option<crate::compiled_backend::GuestClock>,
+    ) -> Option<crate::compiled_backend::GuestClock> {
+        WasmtimeBackend::set_clock(self, clock)
+    }
+
+    fn set_assist(
+        &mut self,
+        assist: Option<crate::compiled_backend::GuestAssist>,
+    ) -> Option<crate::compiled_backend::GuestAssist> {
+        WasmtimeBackend::set_assist(self, assist)
+    }
+
+    fn can_assist(&self) -> bool {
+        WasmtimeBackend::has_assist(self)
+    }
+
+    fn set_ram_base(&mut self, ram_base: u64) {
+        WasmtimeBackend::set_ram_base(self, ram_base);
+    }
+
+    fn flush_tlb(&mut self) {
+        WasmtimeBackend::flush_tlb(self);
+    }
+
+    fn set_translator(&mut self, translator: Option<GuestTranslator>) -> Option<GuestTranslator> {
+        WasmtimeBackend::set_translator(self, translator)
+    }
+
+    fn set_accessor(&mut self, accessor: Option<GuestAccessor>) -> Option<GuestAccessor> {
+        WasmtimeBackend::set_accessor(self, accessor)
+    }
+
+    fn last_retired(&self) -> u64 {
+        WasmtimeBackend::last_retired(self)
+    }
+
+    fn run_chain(
+        &mut self,
+        entry_index: u32,
+        cpu: &mut aero_cpu_core::state::CpuState,
+        lookup: &mut dyn FnMut(u64, u64) -> Option<u32>,
+        max_blocks: u32,
+    ) -> crate::compiled_backend::ChainOutcome {
+        WasmtimeBackend::execute_chain(self, entry_index, cpu, lookup, max_blocks)
     }
 }

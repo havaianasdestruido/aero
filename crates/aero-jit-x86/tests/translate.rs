@@ -82,6 +82,17 @@ fn compute_sub_flags(width: Width, lhs: u64, rhs: u64, result: u64) -> FlagVals 
     }
 }
 
+/// Flags a shift or rotate writes, mirroring `tier1::translate::shift_flag_set`.
+///
+/// AF is undefined after SHL/SHR/SAR; Tier-0 clears it and Tier-1 matches, so the
+/// reference model has to as well or it disagrees with both.
+fn ref_shift_flag_set(op: ShiftOp) -> FlagSet {
+    match op {
+        ShiftOp::Shl | ShiftOp::Shr | ShiftOp::Sar => FlagSet::ALU,
+        ShiftOp::Rol | ShiftOp::Ror => FlagSet::ALU.without(FlagSet::AF),
+    }
+}
+
 fn update_shift_flags(
     cpu: &mut CpuState,
     width: Width,
@@ -110,6 +121,9 @@ fn update_shift_flags(
     }
     if flags.contains(FlagSet::SF) {
         write_flag(cpu, Flag::Sf, (result & sign_bit) != 0);
+    }
+    if flags.contains(FlagSet::AF) {
+        write_flag(cpu, Flag::Af, false);
     }
     if flags.contains(FlagSet::PF) {
         write_flag(cpu, Flag::Pf, parity_even(result as u8));
@@ -236,6 +250,19 @@ fn exec_x86_block<B: Tier1Bus>(insts: &[DecodedInst], cpu: &mut CpuState, bus: &
                 write_op(inst, cpu, bus, dst, *width, v);
                 cpu.rip = next;
             }
+            InstKind::MovZx {
+                dst,
+                src,
+                dst_width,
+                src_width,
+            } => {
+                // Read narrow, write wide with the high bits clear. `read_op`
+                // already returns a value masked to its width, so the extension is
+                // just writing it at the destination's.
+                let v = read_op(inst, cpu, bus, src, *src_width);
+                write_op(inst, cpu, bus, dst, *dst_width, v);
+                cpu.rip = next;
+            }
             InstKind::Lea { dst, addr, width } => {
                 let a = calc_addr(inst, cpu, addr);
                 write_gpr_part(cpu, dst.gpr, *width, false, a);
@@ -350,7 +377,7 @@ fn exec_x86_block<B: Tier1Bus>(insts: &[DecodedInst], cpu: &mut CpuState, bus: &
                     l,
                     amt,
                     res,
-                    FlagSet::ALU.without(FlagSet::AF),
+                    ref_shift_flag_set(*op),
                 );
                 write_op(inst, cpu, bus, dst, *width, res);
                 cpu.rip = next;
@@ -391,7 +418,7 @@ fn exec_x86_block<B: Tier1Bus>(insts: &[DecodedInst], cpu: &mut CpuState, bus: &
                     l,
                     amt,
                     res,
-                    FlagSet::ALU.without(FlagSet::AF),
+                    ref_shift_flag_set(*op),
                 );
                 write_op(inst, cpu, bus, dst, *width, res);
                 cpu.rip = next;
@@ -798,13 +825,13 @@ block 0x6000:
   write.rip v2
   v3 = read.rbx
   v4 = const.i64 0xd
-  v5 = shr.i64 v3, v4 ; flags=CF|PF|ZF|SF|OF
+  v5 = shr.i64 v3, v4 ; flags=CF|PF|AF|ZF|SF|OF
   write.rbx v5
   v6 = const.i64 0x600e
   write.rip v6
   v7 = read.rbx
   v8 = const.i64 0x1
-  v9 = shl.i64 v7, v8 ; flags=CF|PF|ZF|SF|OF
+  v9 = shl.i64 v7, v8 ; flags=CF|PF|AF|ZF|SF|OF
   write.rbx v9
   v10 = const.i64 0x6011
   write.rip v10
@@ -854,7 +881,7 @@ block 0x6100:
   write.rip v2
   v3 = read.ax
   v4 = const.i16 0x11
-  v5 = shl.i16 v3, v4 ; flags=CF|PF|ZF|SF|OF
+  v5 = shl.i16 v3, v4 ; flags=CF|PF|AF|ZF|SF|OF
   write.ax v5
   v6 = const.i64 0x6108
   write.rip v6
@@ -903,7 +930,7 @@ block 0x6200:
   write.rip v2
   v3 = read.al
   v4 = const.i8 0x9
-  v5 = shl.i8 v3, v4 ; flags=CF|PF|ZF|SF|OF
+  v5 = shl.i8 v3, v4 ; flags=CF|PF|AF|ZF|SF|OF
   write.al v5
   v6 = const.i64 0x6205
   write.rip v6
@@ -951,7 +978,7 @@ block 0x6300:
   write.rip v2
   v3 = read.eax
   v4 = const.i32 0x1
-  v5 = shl.i32 v3, v4 ; flags=CF|PF|ZF|SF|OF
+  v5 = shl.i32 v3, v4 ; flags=CF|PF|AF|ZF|SF|OF
   write.eax v5
   v6 = const.i64 0x630c
   write.rip v6
@@ -1000,7 +1027,7 @@ block 0x6400:
   write.rip v2
   v3 = read.al
   v4 = const.i8 0x1
-  v5 = sar.i8 v3, v4 ; flags=CF|PF|ZF|SF|OF
+  v5 = sar.i8 v3, v4 ; flags=CF|PF|AF|ZF|SF|OF
   write.al v5
   v6 = const.i64 0x6404
   write.rip v6
@@ -1047,7 +1074,7 @@ block 0x6500:
   write.rip v2
   v3 = read.ah
   v4 = const.i8 0x1
-  v5 = shl.i8 v3, v4 ; flags=CF|PF|ZF|SF|OF
+  v5 = shl.i8 v3, v4 ; flags=CF|PF|AF|ZF|SF|OF
   write.ah v5
   v6 = const.i64 0x6506
   write.rip v6
@@ -1109,6 +1136,52 @@ fn shift_count_0_leaves_flags_unchanged() {
     assert_eq!(out_status, expected_status);
 }
 
+/// `MOVZX` against the reference model, in both widths and from memory.
+///
+/// The zero extension is the whole point: a wrong one leaves the destination's high
+/// bits carrying whatever the register held before.
+#[test]
+fn movzx_zero_extends_from_register_and_memory() {
+    // mov eax, 0xffffffff
+    // mov cl, 0x81
+    // movzx eax, cl          ; 0f b6 c1
+    // movzx edx, word [rsi]  ; 0f b7 16
+    // ret
+    let code = [
+        0xb8, 0xff, 0xff, 0xff, 0xff, // mov eax, 0xffffffff
+        0xb1, 0x81, // mov cl, 0x81
+        0x0f, 0xb6, 0xc1, // movzx eax, cl
+        0x0f, 0xb7, 0x16, // movzx edx, word [rsi]
+        0xc3, // ret
+    ];
+
+    let entry = 0x6800u64;
+    let mut cpu = CpuState {
+        rip: entry,
+        ..Default::default()
+    };
+    write_gpr(&mut cpu, Gpr::Rsp, 0x9000);
+    write_gpr(&mut cpu, Gpr::Rsi, 0xa000);
+    // Start EDX full so a missing extension would leave high bits set.
+    write_gpr(&mut cpu, Gpr::Rdx, 0xffff_ffff_ffff_ffff);
+
+    let mut bus = SimpleBus::new(0x10000);
+    bus.write(0x9000, Width::W64, 0x7000);
+    bus.write(0xa000, Width::W16, 0xbeef);
+
+    let out = assert_block_exec_matches_x86(&code, entry, cpu, bus);
+    assert_eq!(
+        out.gpr[Gpr::Rax.as_u8() as usize],
+        0x81,
+        "movzx eax, cl must clear every bit above the byte"
+    );
+    assert_eq!(
+        out.gpr[Gpr::Rdx.as_u8() as usize],
+        0xbeef,
+        "movzx edx, word [rsi] must clear every bit above the word"
+    );
+}
+
 #[test]
 fn shift_count_1_sets_cf_and_of() {
     // mov al, 0x81
@@ -1146,8 +1219,11 @@ fn shift_count_1_sets_cf_and_of() {
     assert!(out.rflags & aero_cpu_core::state::RFLAGS_ZF == 0);
     assert!(out.rflags & aero_cpu_core::state::RFLAGS_SF == 0);
     assert!(out.rflags & aero_cpu_core::state::RFLAGS_PF == 0);
-    // x86 defines AF as undefined after shifts; we conservatively leave it unchanged.
-    assert!(out.rflags & aero_cpu_core::state::RFLAGS_AF != 0);
+    // AF is undefined after a shift, so the architecture permits any value — but a
+    // tiered CPU has to pick one and stick to it, because the guest can set flags in
+    // one tier and read them in another. Tier-0 clears AF here, so Tier-1 does too;
+    // AF was seeded to 1 above, and the shift must have cleared it.
+    assert!(out.rflags & aero_cpu_core::state::RFLAGS_AF == 0);
 }
 
 #[test]
@@ -1312,7 +1388,7 @@ block 0x6b00:
   write.rip v5
   v6 = read.al
   v7 = const.i8 0x1
-  v8 = shl.i8 v6, v7 ; flags=CF|PF|ZF|SF|OF
+  v8 = shl.i8 v6, v7 ; flags=CF|PF|AF|ZF|SF|OF
   write.al v8
   v9 = const.i64 0x6b06
   write.rip v9

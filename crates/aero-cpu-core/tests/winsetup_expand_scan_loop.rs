@@ -36,7 +36,11 @@ fn fresh_cpu() -> CpuCore {
     cpu
 }
 
-fn run(cpu: &mut CpuCore, bus: &mut FlatTestBus, max: u64) -> aero_cpu_core::interp::tier0::exec::BatchResult {
+fn run(
+    cpu: &mut CpuCore,
+    bus: &mut FlatTestBus,
+    max: u64,
+) -> aero_cpu_core::interp::tier0::exec::BatchResult {
     let mut ctx = AssistContext::default();
     let mut cfg = Tier0Config::from_cpuid(&ctx.features);
     cfg.exit_on_branch = false;
@@ -71,7 +75,11 @@ fn winsetup_e8_scan_batch_matches_single_step_oracle() {
         STREAM + 8,
         "rdx must land on the 0xe8"
     );
-    assert_eq!(counter(&batched_bus), 9, "byte counter must count 8 zeros + the 0xe8");
+    assert_eq!(
+        counter(&batched_bus),
+        9,
+        "byte counter must count 8 zeros + the 0xe8"
+    );
     assert_eq!(
         batched.state.rip(),
         LOOP_RIP + LOOP.len() as u64 + 1,

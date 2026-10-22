@@ -9,12 +9,11 @@
 //! because translating a block that runs once costs more than interpreting it.
 
 use std::cell::Cell;
-use std::collections::{HashMap, HashSet};
 
 use aero_cpu_core::mem::CpuBus;
 use aero_cpu_core::state::CpuState;
 use aero_jit_x86::tier1::ir::interp::{
-    execute_block_cpu, execute_block_cpu_state, ExecResult, TestCpu,
+    execute_block_cpu_state, execute_block_cpu_with_scratch, ExecResult, TestCpu,
 };
 use aero_jit_x86::tier1::ir::{IrBlock, IrInst};
 use aero_jit_x86::tier1::{discover_block, translate_block, BlockLimits};
@@ -23,31 +22,93 @@ use aero_jit_x86::Width;
 
 // ── IR interpreter fast-path (no WASM engine required) ───────────────────────
 
+/// Read a tuning knob from the environment, falling back to `default`.
+///
+/// These exist so the tiering thresholds can be swept against a real workload
+/// without a rebuild; the defaults are what ships.
+#[cfg(not(target_arch = "wasm32"))]
+fn env_u32(name: &str, default: u32) -> u32 {
+    std::env::var(name)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(default)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn env_u32(_name: &str, default: u32) -> u32 {
+    default
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(default)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn env_usize(_name: &str, default: usize) -> usize {
+    default
+}
+
+pub use crate::rip_map::{RipBuildHasher, RipHasher, RipMap, RipSet};
+
+/// Longest chain of cached blocks a single entry may run.
+///
+/// Read once: this sits on the chain's hot path and must not touch the environment
+/// per call.
+fn max_chain_blocks() -> u64 {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        *N.get_or_init(|| u64::from(env_u32("AERO_JIT_MAX_CHAIN", 4096)))
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        4096
+    }
+}
+
 /// IR block cache entry: stores a pre-decoded + translated IR block ready for
 /// execution by the IR interpreter.
 pub struct IrBlockCache {
     /// Maps entry RIP → compiled IR block.
-    blocks: HashMap<u64, IrBlock>,
+    blocks: RipMap<IrBlock>,
     /// Number of guest x86 instructions represented by each compiled block.
     ///
     /// `IrBlock::insts.len()` is the number of lowered IR operations, not the
     /// architectural retired-instruction count.
-    guest_instruction_counts: HashMap<u64, u64>,
+    guest_instruction_counts: RipMap<u64>,
     /// Hotness counters per RIP.
-    hotness: HashMap<u64, u32>,
+    hotness: RipMap<u32>,
     /// RIPs currently being compiled (prevent recompilation).
-    compiling: HashSet<u64>,
+    compiling: RipSet,
     /// RIPs that failed admission (helpers / empty blocks). Remember
     /// them so a hot rejected loop does not rediscover and translate
     /// every `hot_threshold` hits — that tax collapsed a live WMI
     /// slice from ~4.5 to ~1.2 Minst/s.
-    rejected: HashSet<u64>,
+    rejected: RipSet,
     /// Block discovery limits.
     limits: BlockLimits,
     /// Hotness threshold: a block must be hit this many times before compilation.
     hot_threshold: u32,
+    /// Threshold for a RIP found by a chain running off the end of the cache.
+    chain_miss_threshold: u32,
     /// Maximum number of cached blocks (LRU eviction when exceeded).
     max_blocks: usize,
+    /// Cap on live hotness counters before the whole map is dropped.
+    max_hotness_entries: usize,
+    /// Cached blocks that touch no guest memory.
+    ///
+    /// These are the ones a compiled tier can run without any address-translation
+    /// machinery: no inline TLB, no MMIO exit, nothing to roll back. Counted to size
+    /// that opportunity before building for it.
+    memory_free_blocks: u64,
+    /// Guest instructions executed from memory-free cached blocks.
+    memory_free_insts: u64,
     /// Diagnostic counters for proving that the cached path actually ran.
     executed_blocks: u64,
     executed_guest_instructions: u64,
@@ -62,14 +123,18 @@ impl Default for IrBlockCache {
 impl IrBlockCache {
     pub fn new() -> Self {
         Self {
-            blocks: HashMap::new(),
-            guest_instruction_counts: HashMap::new(),
-            hotness: HashMap::new(),
-            compiling: HashSet::new(),
-            rejected: HashSet::new(),
+            blocks: RipMap::default(),
+            guest_instruction_counts: RipMap::default(),
+            hotness: RipMap::default(),
+            compiling: RipSet::default(),
+            rejected: RipSet::default(),
             limits: BlockLimits::default(),
-            hot_threshold: 50,
-            max_blocks: 4096,
+            hot_threshold: env_u32("AERO_JIT_HOT_THRESHOLD", 50),
+            chain_miss_threshold: env_u32("AERO_JIT_CHAIN_THRESHOLD", 2),
+            max_blocks: env_usize("AERO_JIT_MAX_BLOCKS", 4096),
+            max_hotness_entries: env_usize("AERO_JIT_MAX_HOTNESS", 65_536),
+            memory_free_blocks: 0,
+            memory_free_insts: 0,
             executed_blocks: 0,
             executed_guest_instructions: 0,
         }
@@ -77,14 +142,40 @@ impl IrBlockCache {
 
     /// Record a hit at `rip` and return `true` if the block should be compiled.
     pub fn record_hit(&mut self, rip: u64) -> bool {
+        self.record_hit_with_threshold(rip, self.hot_threshold)
+    }
+
+    /// Record a hit at a RIP reached by a chain running off the end of the cache.
+    ///
+    /// A much stronger signal than the batch-boundary sample [`record_hit`] gets:
+    /// we only arrived here by executing cached blocks, so `rip` is on a path
+    /// already known to be hot, and compiling it extends that chain rather than
+    /// starting a new one. Hence the lower threshold.
+    ///
+    /// [`record_hit`]: Self::record_hit
+    pub fn record_chain_miss(&mut self, rip: u64) -> bool {
+        self.record_hit_with_threshold(rip, self.chain_miss_threshold)
+    }
+
+    fn record_hit_with_threshold(&mut self, rip: u64, threshold: u32) -> bool {
         if self.rejected.contains(&rip) {
             return false;
         }
+        // Checked before the bump so a cached block cannot accumulate hotness it
+        // can never spend.
+        if self.blocks.contains_key(&rip) || self.compiling.contains(&rip) {
+            return false;
+        }
+        // A long-running guest walks through far more distinct entries than it ever
+        // runs hot, and counters for the cold ones are pure growth. Drop them
+        // wholesale when there are too many: anything genuinely hot re-arms within
+        // a few hits, and the alternative is a map that only grows.
+        if self.hotness.len() >= self.max_hotness_entries {
+            self.hotness.clear();
+        }
         let count = self.hotness.entry(rip).or_insert(0);
         *count += 1;
-        *count >= self.hot_threshold
-            && !self.blocks.contains_key(&rip)
-            && !self.compiling.contains(&rip)
+        *count >= threshold
     }
 
     /// Check if a compiled block exists for `rip`.
@@ -108,6 +199,12 @@ impl IrBlockCache {
         self.compiling.remove(&rip);
 
         if let Some((ir, guest_instruction_count)) = result {
+            if !ir.insts.iter().any(|i| {
+                matches!(i, IrInst::Load { .. }) || matches!(i, IrInst::Store { .. })
+            }) {
+                self.memory_free_blocks += 1;
+                self.memory_free_insts += guest_instruction_count;
+            }
             self.blocks.insert(rip, ir);
             self.guest_instruction_counts
                 .insert(rip, guest_instruction_count);
@@ -171,6 +268,14 @@ impl IrBlockCache {
         self.executed_guest_instructions = self
             .executed_guest_instructions
             .saturating_add(guest_instruction_count);
+    }
+
+    pub fn memory_free_blocks(&self) -> u64 {
+        self.memory_free_blocks
+    }
+
+    pub fn memory_free_insts(&self) -> u64 {
+        self.memory_free_insts
     }
 
     pub fn executed_blocks(&self) -> u64 {
@@ -394,7 +499,11 @@ pub fn run_ir_chain<B: CpuBus>(
     };
     let mut guest_insts = 0u64;
     let mut blocks = 0u64;
-    const MAX_CHAIN_BLOCKS: u64 = 4096;
+    let max_chain_blocks = max_chain_blocks();
+    // One buffer for the whole chain. Sizing it per block inside the loop is an
+    // allocator round-trip per block, which is most of what the chain is trying to
+    // save over interpreting the same instructions.
+    let mut temps: Vec<u64> = Vec::new();
 
     loop {
         let rip = test_cpu.rip;
@@ -404,11 +513,11 @@ pub fn run_ir_chain<B: CpuBus>(
         let Some(count) = cache.guest_instruction_count(rip) else {
             break;
         };
-        if guest_insts.saturating_add(count) > max_guest_insts || blocks >= MAX_CHAIN_BLOCKS {
+        if guest_insts.saturating_add(count) > max_guest_insts || blocks >= max_chain_blocks {
             break;
         }
         let before = test_cpu;
-        match execute_block_cpu(block, &mut test_cpu, &mut adapter) {
+        match execute_block_cpu_with_scratch(block, &mut test_cpu, &mut adapter, &mut temps) {
             ExecResult::Continue => {
                 if adapter.faulted.get() {
                     test_cpu = before;

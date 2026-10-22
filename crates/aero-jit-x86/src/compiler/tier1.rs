@@ -75,7 +75,13 @@ pub fn compile_tier1_block_with_options<B: Tier1Bus>(
         }
         count
     };
-    let ir = translate_block(&block);
+    let mut ir = translate_block(&block);
+    // Most x86 arithmetic sets six flags nobody goes on to read. Dropping the
+    // writes a later write shadows costs nothing and removes a large share of what
+    // compiled code spends its time on. Done here rather than in a caller so every
+    // consumer of this entry point gets it — including the browser's Tier-1, which
+    // compiles through `aero-jit-wasm` and shares this code generator.
+    let _dropped = crate::tier1::eliminate_dead_flags(&mut ir);
 
     if let Some(helper) = ir.insts.iter().find_map(|inst| match inst {
         IrInst::CallHelper { helper, .. } => Some(helper),

@@ -13,19 +13,23 @@ use aero_cpu_core::state::{gpr, CpuMode};
 use aero_cpu_core::CpuCore;
 
 const VERBATIM: [u8; 22] = [
-    0x8a, 0x01, 0x41, 0xff, 0xca, 0xff, 0xc6, 0x43, 0x88, 0x04, 0x3e, 0x49, 0xff, 0xc6, 0x48,
-    0xff, 0xc1, 0x45, 0x85, 0xd2, 0x7f, 0xea,
+    0x8a, 0x01, 0x41, 0xff, 0xca, 0xff, 0xc6, 0x43, 0x88, 0x04, 0x3e, 0x49, 0xff, 0xc6, 0x48, 0xff,
+    0xc1, 0x45, 0x85, 0xd2, 0x7f, 0xea,
 ];
 const ALIGNED: [u8; 25] = [
-    0x49, 0x8b, 0x11, 0x41, 0xff, 0xca, 0xff, 0xc3, 0x41, 0x8a, 0x0c, 0x10, 0x41, 0xff, 0xc0,
-    0x42, 0x88, 0x0c, 0x22, 0x49, 0xff, 0xc4, 0x45, 0x85, 0xd2, // 7f xx patched below
+    0x49, 0x8b, 0x11, 0x41, 0xff, 0xca, 0xff, 0xc3, 0x41, 0x8a, 0x0c, 0x10, 0x41, 0xff, 0xc0, 0x42,
+    0x88, 0x0c, 0x22, 0x49, 0xff, 0xc4, 0x45, 0x85, 0xd2, // 7f xx patched below
 ];
 
 const CODE: u64 = 0x1000;
 const WINDOW: u64 = 0x2000;
 const OUT: u64 = 0x3000;
 
-fn run(cpu: &mut CpuCore, bus: &mut FlatTestBus, max: u64) -> aero_cpu_core::interp::tier0::exec::BatchResult {
+fn run(
+    cpu: &mut CpuCore,
+    bus: &mut FlatTestBus,
+    max: u64,
+) -> aero_cpu_core::interp::tier0::exec::BatchResult {
     let mut ctx = AssistContext::default();
     let mut cfg = Tier0Config::from_cpuid(&ctx.features);
     cfg.exit_on_branch = false;
@@ -51,7 +55,11 @@ fn oracle_vs_batch(mut setup: impl FnMut(&mut CpuCore, &mut FlatTestBus)) {
     let batched_res = run(&mut batched, &mut batched_bus, 10_000);
 
     assert_eq!(batched.state.rip(), stepped.state.rip(), "rip");
-    assert_eq!(batched.state.rflags() & 0x8d5, stepped.state.rflags() & 0x8d5, "status flags");
+    assert_eq!(
+        batched.state.rflags() & 0x8d5,
+        stepped.state.rflags() & 0x8d5,
+        "status flags"
+    );
     for r in 0..16 {
         assert_eq!(
             batched.state.read_gpr64(r),
@@ -103,11 +111,10 @@ fn aligned_match_copy_batch_matches_single_step() {
         cpu.state.write_gpr64(gpr::RBX, 0);
         cpu.state.write_gpr64(gpr::R8, 0);
         cpu.state.write_gpr64(gpr::R12, 0); // dest offset into window — write at WINDOW+0
-        // Put dest in a separate region by using a copy dest via r12 offset.
-        // Store is [rdx+r12]; rdx is WINDOW, so write at WINDOW+r12.
-        // Use r12 = OUT-WINDOW so dest is OUT.
-        cpu.state
-            .write_gpr64(gpr::R12, OUT.wrapping_sub(WINDOW));
+                                            // Put dest in a separate region by using a copy dest via r12 offset.
+                                            // Store is [rdx+r12]; rdx is WINDOW, so write at WINDOW+r12.
+                                            // Use r12 = OUT-WINDOW so dest is OUT.
+        cpu.state.write_gpr64(gpr::R12, OUT.wrapping_sub(WINDOW));
         cpu.state.write_gpr64(gpr::RCX, 0);
         cpu.state.write_gpr64(gpr::RDX, 0);
     });

@@ -11,6 +11,10 @@ default = []
 legacy-baseline = []
 # Emit an inline direct-mapped TLB + direct-RAM fast-path for Tier-1 WASM codegen.
 tier1-inline-tlb = []
+# Let Wasmtime write a jitdump so `perf inject --jit` can disassemble generated code.
+# Diagnostic only, and off by default: it pulls extra machinery into the engine, and
+# the switch that uses it (`AERO_JIT_JITDUMP`) is inert without it.
+wasmtime-jitdump = ["wasmtime/profiling"]
 [dependencies]
 wasm-encoder = "0.244.0"
 thiserror = "2.0.17"
@@ -22,10 +26,16 @@ aero-x86 = { path = "../aero-x86" }
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 # Wasmtime is only used as a reference backend for executing Tier-1 WASM blocks on native targets.
 # Disable its default feature set to keep compile times and dependency size manageable.
-wasmtime = { version = "40.0.1", default-features = false, features = ["cranelift", "runtime", "std"] }
+wasmtime = { version = "40.0.1", default-features = false, features = ["cranelift", "winch", "runtime", "std"] }
+# One guest memory, mapped into two Wasmtime engines. Winch compiles cheaply and
+# Cranelift compiles well, the compiler is chosen per `Engine`, and an engine can
+# only reach guest memory it created — so the backing pages, guard region included,
+# are mapped here and handed to both.
+libc = "0.2"
 
 [dev-dependencies]
 memoffset = "0.9"
+wasmprinter = "0.243.0"
 wasmparser = "0.244.0"
 wasmi = "1.0.7"
 
@@ -34,7 +44,7 @@ rand = "0.9"
 rand_chacha = "0.9"
 # Enable shared-memory instantiation tests (`wasmtime::SharedMemory` + `Config::wasm_threads`) without
 # forcing the entire crate's normal build to depend on Wasmtime's threads support.
-wasmtime = { version = "40.0.1", default-features = false, features = ["cranelift", "runtime", "std", "threads"] }
+wasmtime = { version = "40.0.1", default-features = false, features = ["cranelift", "winch", "runtime", "std", "threads"] }
 
 [[test]]
 name = "wasm_codegen"
@@ -44,4 +54,16 @@ required-features = ["legacy-baseline"]
 [[test]]
 name = "tier1_inline_tlb"
 path = "tests/tier1_inline_tlb.rs"
+required-features = ["tier1-inline-tlb"]
+
+# The translator seam only does anything when the inline TLB is compiled in; the
+# code generator drops it otherwise and every access takes the helper path.
+[[test]]
+name = "backend_translator"
+path = "tests/backend_translator.rs"
+required-features = ["tier1-inline-tlb"]
+
+[[test]]
+name = "compile_cost"
+path = "tests/compile_cost.rs"
 required-features = ["tier1-inline-tlb"]

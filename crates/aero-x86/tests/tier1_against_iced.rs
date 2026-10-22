@@ -84,8 +84,30 @@ proptest! {
                 // Tier-1 treats NOP-ish encodings (eg. `0x90`, `F3 90`/`PAUSE`, multi-byte NOPs)
                 // as a single `Nop` kind. Ensure iced did not decode it as a real `XCHG` (e.g.
                 // `REX.B 90`) or some other instruction with side effects.
+                //
+                // The hint opcodes belong here too, and they are the reason this list grew:
+                // `0F 0D` and `0F 18` are decoded since `AERO_X86_NO_HINT_OPS` became
+                // opt-out, and iced names them `Reservednop` and `Prefetch*` rather than
+                // `Nop`. Both are architecturally side-effect-free — that is what "reserved
+                // NOP" means, and a prefetch is a hint by definition — so folding them into
+                // `Nop` is correct, and the different mnemonic is a naming difference rather
+                // than a decode disagreement. Anything with a real effect must still fail.
                 prop_assert!(
-                    matches!(iced.mnemonic(), Mnemonic::Nop | Mnemonic::Pause),
+                    matches!(
+                        iced.mnemonic(),
+                        Mnemonic::Nop
+                            | Mnemonic::Pause
+                            | Mnemonic::Reservednop
+                            | Mnemonic::Prefetch
+                            | Mnemonic::Prefetchw
+                            | Mnemonic::Prefetchnta
+                            | Mnemonic::Prefetcht0
+                            | Mnemonic::Prefetcht1
+                            | Mnemonic::Prefetcht2
+                            | Mnemonic::Prefetchwt1
+                            | Mnemonic::Prefetchit0
+                            | Mnemonic::Prefetchit1
+                    ),
                     "tier1 decoded Nop but iced decoded as {:?} ({:?})",
                     iced.mnemonic(),
                     iced.code(),

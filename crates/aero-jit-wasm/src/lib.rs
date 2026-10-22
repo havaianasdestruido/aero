@@ -7,6 +7,10 @@
 // and the threaded/shared-memory variant (pinned nightly toolchain for `-Z build-std`). Keep the
 // Rust code free of unstable language features so both builds remain viable.
 
+/// A [`CompiledBackend`] over the browser's own WebAssembly engine.
+#[cfg(target_arch = "wasm32")]
+pub mod browser_backend;
+
 #[cfg(target_arch = "wasm32")]
 use core::cell::Cell;
 
@@ -195,6 +199,7 @@ pub fn compile_tier1_block(
     let limits = BlockLimits {
         max_insts: max_insts.min(code_len as u32) as usize,
         max_bytes: max_bytes.min(code_len as u32) as usize,
+            ..BlockLimits::default()
     };
 
     // Browser tiered execution relies on the host-side runtime to observe guest stores (for

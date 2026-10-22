@@ -26,7 +26,11 @@ const WALK: [u8; 37] = [
 const CODE: u64 = 0x1000;
 const TABLE: u64 = 0x2000;
 
-fn run(cpu: &mut CpuCore, bus: &mut FlatTestBus, max: u64) -> aero_cpu_core::interp::tier0::exec::BatchResult {
+fn run(
+    cpu: &mut CpuCore,
+    bus: &mut FlatTestBus,
+    max: u64,
+) -> aero_cpu_core::interp::tier0::exec::BatchResult {
     let mut ctx = AssistContext::default();
     let mut cfg = Tier0Config::from_cpuid(&ctx.features);
     cfg.exit_on_branch = false;
@@ -80,12 +84,28 @@ fn huffman_walk_batch_matches_single_step() {
         7,
         "walk must land on the leaf"
     );
-    assert_eq!(batched.state.read_gpr64(gpr::R8), stepped.state.read_gpr64(gpr::R8));
-    assert_eq!(batched.state.read_gpr64(gpr::RCX), stepped.state.read_gpr64(gpr::RCX));
-    assert_eq!(batched.state.read_gpr64(gpr::RAX), stepped.state.read_gpr64(gpr::RAX));
-    assert_eq!(batched.state.rflags() & 0x8d5, stepped.state.rflags() & 0x8d5);
+    assert_eq!(
+        batched.state.read_gpr64(gpr::R8),
+        stepped.state.read_gpr64(gpr::R8)
+    );
+    assert_eq!(
+        batched.state.read_gpr64(gpr::RCX),
+        stepped.state.read_gpr64(gpr::RCX)
+    );
+    assert_eq!(
+        batched.state.read_gpr64(gpr::RAX),
+        stepped.state.read_gpr64(gpr::RAX)
+    );
+    assert_eq!(
+        batched.state.rflags() & 0x8d5,
+        stepped.state.rflags() & 0x8d5
+    );
     assert_eq!(batched_res.executed, step_n);
-    assert!(batched_res.executed >= 16, "two walk steps, got {}", batched_res.executed);
+    assert!(
+        batched_res.executed >= 16,
+        "two walk steps, got {}",
+        batched_res.executed
+    );
 }
 
 #[test]

@@ -103,6 +103,10 @@ mod tests {
     use crate::test_util::capture_panic_location;
     use crate::tier2::ir::{Instr, Operand, TraceIr, ValueId};
 
+    // Verification of the trace IR is a `debug_assert!`, so in a release build there is
+    // no panic to catch and this test asserted against something that cannot happen. It
+    // had been failing in every release run long enough to be treated as furniture.
+    #[cfg(debug_assertions)]
     #[test]
     fn optimize_trace_panics_at_call_site_on_invalid_ir() {
         // A trace that uses an undefined value should fail verification in debug builds.

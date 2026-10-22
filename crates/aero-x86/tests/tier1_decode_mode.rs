@@ -39,8 +39,7 @@ fn decode_one_mode_32bit_modrm_disp32_is_not_rip_relative() {
                 index: None,
                 scale: 1,
                 disp: 0x1234,
-                rip_relative: false,
-            }),
+                rip_relative: false, segment: None }),
             width: Width::W32,
         }
     );
@@ -63,8 +62,7 @@ fn decode_one_mode_32bit_d0_disp32_is_not_rip_relative() {
                 index: None,
                 scale: 1,
                 disp: 0x1234,
-                rip_relative: false,
-            }),
+                rip_relative: false, segment: None }),
             count: 1,
             width: Width::W8,
         }
@@ -156,8 +154,7 @@ fn decode_one_mode_16bit_modrm_bx_si_disp8() {
                 index: Some(Gpr::Rsi),
                 scale: 1,
                 disp: 0x10,
-                rip_relative: false,
-            }),
+                rip_relative: false, segment: None }),
             width: Width::W16,
         }
     );
@@ -507,8 +504,7 @@ fn decode_long_mode_cmp_byte_ptr_rdx_imm8_is_cmp() {
                 index: None,
                 scale: 1,
                 disp: 0,
-                rip_relative: false,
-            }),
+                rip_relative: false, segment: None }),
             rhs: Operand::Imm(0xe8),
             width: Width::W8,
         }
@@ -738,5 +734,38 @@ fn decode_long_mode_bswap_r8_is_bswap() {
             },
             width: Width::W64,
         }
+    );
+}
+
+/// A `REX` prefix only applies when it is the last prefix before the opcode.
+///
+/// `48 F2 B8 imm32` is `MOV EAX, imm32` with the `REX.W` discarded by the `F2` that
+/// follows it — 7 bytes — not `MOV RAX, imm64` at 11. Decoding it as the latter runs
+/// four bytes of the *next* instruction as part of this one, so the whole block after
+/// it is garbage. Real compilers do not emit this ordering, which is why it survived;
+/// a proptest against iced generated it.
+///
+/// ```text
+/// cargo test --release -p aero-x86 --test tier1_decode_mode
+/// ```
+#[test]
+fn a_rex_followed_by_another_prefix_does_not_apply() {
+    // 48 (REX.W) F2 (REPNE) B8 (MOV eAX, imm) 00000000
+    let bytes = [0x48u8, 0xf2, 0xb8, 0x00, 0x00, 0x00, 0x00];
+    let inst = decode_one_mode(0, &bytes, 64);
+    assert_eq!(
+        inst.len, 7,
+        "REX.W must be discarded by the following prefix, making this a 32-bit MOV"
+    );
+
+    // And with the prefixes the other way round it *is* the 64-bit form, so the fix
+    // is about ordering rather than about ignoring REX whenever F2 appears.
+    let bytes = [
+        0xf2u8, 0x48, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ];
+    let inst = decode_one_mode(0, &bytes, 64);
+    assert_eq!(
+        inst.len, 11,
+        "REX.W is the last prefix here, so this is MOV RAX, imm64"
     );
 }

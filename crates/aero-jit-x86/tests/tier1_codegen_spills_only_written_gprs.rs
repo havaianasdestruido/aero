@@ -402,13 +402,13 @@ fn tier1_codegen_flag_writes_spill_rflags() {
     block.validate().unwrap();
 
     let wasm = Tier1WasmCodegen::new().compile_block(&block);
-    let (loads, stores) = collect_cpu_ptr_i64_load_store_offsets(&wasm);
+    let (_loads, stores) = collect_cpu_ptr_i64_load_store_offsets(&wasm);
+    // Flags must be handed on, but not necessarily through RFLAGS: with lazy flags an
+    // ALU operation is recorded in the descriptor and RFLAGS is left as it was found,
+    // so the block skips that round trip. Either mechanism satisfies the contract.
     assert!(
-        loads.contains(&(abi::CPU_RFLAGS_OFF as u64)),
-        "expected CpuState.rflags to be loaded when flags are written"
-    );
-    assert!(
-        stores.contains(&(abi::CPU_RFLAGS_OFF as u64)),
-        "expected CpuState.rflags to be spilled when flags are written"
+        stores.contains(&(abi::CPU_RFLAGS_OFF as u64))
+            || stores.contains(&(abi::CPU_LAZY_FLAGS_OFF as u64)),
+        "expected the flags to be handed on, through RFLAGS or the lazy descriptor"
     );
 }

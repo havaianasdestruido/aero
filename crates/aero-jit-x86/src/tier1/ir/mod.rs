@@ -54,12 +54,26 @@ pub enum GuestReg {
     Rip,
     Gpr { reg: Gpr, width: Width, high8: bool },
     Flag(aero_types::Flag),
+    /// Base of a segment with a non-zero base in long mode.
+    ///
+    /// Read-only here: it changes through `swapgs` and `wrmsr`, neither of which
+    /// Tier-1 translates, so a block that could alter it ends before it does.
+    SegBase(SegBase),
+}
+
+/// The segments whose base still matters in long mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SegBase {
+    Fs,
+    Gs,
 }
 
 impl fmt::Display for GuestReg {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             GuestReg::Rip => f.write_str("rip"),
+            GuestReg::SegBase(SegBase::Fs) => f.write_str("fs.base"),
+            GuestReg::SegBase(SegBase::Gs) => f.write_str("gs.base"),
             GuestReg::Gpr { reg, width, high8 } => {
                 // Mirror the `aero_x86::Reg` formatting for stability.
                 if *width == Width::W8 {
@@ -181,6 +195,16 @@ pub enum IrInst {
         src: ValueId,
         width: Width,
     },
+    /// Re-type a value at a wider width, clearing the new high bits.
+    ///
+    /// The counterpart of [`IrInst::Trunc`], which the validator will not let widen.
+    /// Needed by `MOVZX`, where a narrow load has to become a wide register value —
+    /// a register write must match the register's width exactly.
+    Zext {
+        dst: ValueId,
+        src: ValueId,
+        width: Width,
+    },
     Load {
         dst: ValueId,
         addr: ValueId,
@@ -215,6 +239,17 @@ pub enum IrInst {
         dst: ValueId,
         cond: Cond,
     },
+    /// Leave the block for `target` when `cond` holds.
+    ///
+    /// This is what lets a block continue past a conditional branch instead of ending
+    /// at it. The fall-through path keeps going in the same function, with the guest
+    /// registers still in wasm locals; the taken path leaves. Blocks here average 4.2
+    /// guest instructions precisely because they stop at the first branch, and every
+    /// stop costs a spill, a host call and a reload.
+    SideExit {
+        cond: ValueId,
+        target: u64,
+    },
     Select {
         dst: ValueId,
         cond: ValueId,
@@ -222,10 +257,46 @@ pub enum IrInst {
         if_false: ValueId,
         width: Width,
     },
+    /// Perform the guest instruction at `rip` on the host, and carry on.
+    ///
+    /// This is what lets a block survive an instruction Tier-1 cannot translate.
+    /// Ending the block there instead — which is what every earlier attempt did —
+    /// means something has to be compiled at wherever the guest lands, and the
+    /// instructions Tier-1 refuses come in short runs, so that lands on another one.
+    ///
+    /// `next_rip` is where the block expects to continue. The host returns where the
+    /// guest actually went; if the two differ the block leaves, because everything
+    /// after this was decoded on the assumption that they match.
+    Assist {
+        rip: u64,
+        next_rip: u64,
+    },
+    /// Read the machine's timestamp counter into `dst`.
+    ///
+    /// A host call, not a computation: the value comes from the machine's
+    /// `TimeSource`. `rdtsc` is the single largest coverage wall in a Windows
+    /// desktop session — over five million wanted executions of blocks Tier-1 had to
+    /// refuse — because Windows reads it in its scheduler, its spinlocks and its
+    /// performance counters.
+    ReadTsc {
+        dst: ValueId,
+    },
     CallHelper {
         helper: &'static str,
         args: Vec<ValueId>,
         ret: Option<(ValueId, Width)>,
+    },
+    /// Index of the lowest (`forward`) or highest set bit of `src`.
+    ///
+    /// `BSF`/`BSR`. Undefined for a zero source and never used there: the translator
+    /// selects the destination's old value in that case, because that is what the
+    /// hardware and Tier-0 both do. Wasm has `ctz` and `clz`, so this is two
+    /// instructions rather than a helper call.
+    BitScan {
+        dst: ValueId,
+        src: ValueId,
+        width: Width,
+        forward: bool,
     },
 }
 
@@ -234,6 +305,11 @@ impl IrInst {
     pub fn side_effects(&self) -> SideEffects {
         match self {
             IrInst::Const { .. } => SideEffects::NONE,
+            IrInst::Zext { .. } => SideEffects::NONE,
+            IrInst::BitScan { .. } => SideEffects::NONE,
+            // Leaving the block is a control transfer and a RIP write; nothing may be
+            // reordered across it.
+            IrInst::SideExit { .. } => SideEffects::WRITE_REG,
             IrInst::ReadReg { reg, .. } => match reg {
                 GuestReg::Flag(_) => SideEffects::READ_FLAG,
                 _ => SideEffects::READ_REG,
@@ -267,6 +343,8 @@ impl IrInst {
                 }
             }
             IrInst::Select { .. } => SideEffects::NONE,
+            IrInst::Assist { .. } => SideEffects::CALL_HELPER,
+            IrInst::ReadTsc { .. } => SideEffects::CALL_HELPER,
             IrInst::CallHelper { .. } => SideEffects::CALL_HELPER,
         }
     }
@@ -346,6 +424,12 @@ impl IrBlock {
 
         for inst in &self.insts {
             match *inst {
+                IrInst::SideExit { cond, .. } => {
+                    let ty = use_val(cond)?;
+                    if ty != Width::W8 {
+                        return Err(format!("SideExit condition must be i8, got {ty}"));
+                    }
+                }
                 IrInst::Const { dst, width, .. } => define(dst, width)?,
                 IrInst::ReadReg {
                     dst,
@@ -354,11 +438,28 @@ impl IrBlock {
                 IrInst::ReadReg {
                     dst,
                     reg: GuestReg::Rip,
+                }
+                | IrInst::ReadReg {
+                    dst,
+                    reg: GuestReg::SegBase(_),
                 } => define(dst, Width::W64)?,
                 IrInst::ReadReg {
                     dst,
                     reg: GuestReg::Flag(_),
                 } => define(dst, Width::W8)?,
+                IrInst::Zext { dst, src, width } => {
+                    let src_ty = use_val(src)?;
+                    if width.bits() < src_ty.bits() {
+                        return Err(format!("Zext from {src_ty} to {width} narrows"));
+                    }
+                    define(dst, width)?;
+                }
+                IrInst::BitScan {
+                    dst, src, width, ..
+                } => {
+                    let _ = use_val(src)?;
+                    define(dst, width)?;
+                }
                 IrInst::Trunc { dst, src, width } => {
                     let src_ty = use_val(src)?;
                     if width.bits() > src_ty.bits() {
@@ -374,6 +475,12 @@ impl IrBlock {
                     if src_ty != width {
                         return Err(format!("WriteReg width mismatch: {src_ty} -> {width}"));
                     }
+                }
+                IrInst::WriteReg {
+                    reg: GuestReg::SegBase(_),
+                    ..
+                } => {
+                    return Err("segment bases are read-only in Tier-1".to_string());
                 }
                 IrInst::WriteReg {
                     reg: GuestReg::Rip,
@@ -445,6 +552,8 @@ impl IrBlock {
                     }
                     define(dst, width)?;
                 }
+                IrInst::Assist { .. } => {}
+                IrInst::ReadTsc { dst } => define(dst, Width::W64)?,
                 IrInst::CallHelper { ret, ref args, .. } => {
                     for &arg in args {
                         let _ = use_val(arg)?;
@@ -475,10 +584,21 @@ impl IrBlock {
 
 fn inst_to_text(inst: &IrInst) -> String {
     match inst {
+        IrInst::SideExit { cond, target } => format!("sideexit {cond} -> 0x{target:x}"),
         IrInst::Const { dst, value, width } => format!("{dst} = const.{width} 0x{value:x}"),
         IrInst::ReadReg { dst, reg } => format!("{dst} = read.{reg}"),
         IrInst::WriteReg { reg, src } => format!("write.{reg} {src}"),
         IrInst::Trunc { dst, src, width } => format!("{dst} = trunc.{width} {src}"),
+        IrInst::Zext { dst, src, width } => format!("{dst} = zext.{width} {src}"),
+        IrInst::BitScan {
+            dst,
+            src,
+            width,
+            forward,
+        } => format!(
+            "{dst} = {}.{width} {src}",
+            if *forward { "bsf" } else { "bsr" }
+        ),
         IrInst::Load { dst, addr, width } => format!("{dst} = load.{width} [{addr}]"),
         IrInst::Store { addr, src, width } => format!("store.{width} [{addr}], {src}"),
         IrInst::BinOp {
@@ -529,6 +649,10 @@ fn inst_to_text(inst: &IrInst) -> String {
         } => {
             format!("{dst} = select.{width} {cond}, {if_true}, {if_false}")
         }
+        IrInst::Assist { rip, next_rip } => {
+            format!("assist {rip:#x} -> {next_rip:#x}")
+        }
+        IrInst::ReadTsc { dst } => format!("{dst} = rdtsc"),
         IrInst::CallHelper { helper, args, ret } => {
             let arg_list = args
                 .iter()
@@ -594,13 +718,18 @@ impl IrBuilder {
     #[must_use]
     pub fn read_reg(&mut self, reg: GuestReg) -> ValueId {
         let width = match reg {
-            GuestReg::Rip => Width::W64,
+            GuestReg::Rip | GuestReg::SegBase(_) => Width::W64,
             GuestReg::Gpr { width, .. } => width,
             GuestReg::Flag(_) => Width::W8,
         };
         let dst = self.fresh(width);
         self.insts.push(IrInst::ReadReg { dst, reg });
         dst
+    }
+
+    /// Leave the block for `target` when `cond` holds.
+    pub fn side_exit(&mut self, cond: ValueId, target: u64) {
+        self.insts.push(IrInst::SideExit { cond, target });
     }
 
     pub fn write_reg(&mut self, reg: GuestReg, src: ValueId) {
@@ -611,6 +740,24 @@ impl IrBuilder {
     pub fn trunc(&mut self, width: Width, src: ValueId) -> ValueId {
         let dst = self.fresh(width);
         self.insts.push(IrInst::Trunc { dst, src, width });
+        dst
+    }
+
+    /// Hand one guest instruction to the host. See [`IrInst::Assist`].
+    pub fn assist(&mut self, rip: u64, next_rip: u64) {
+        self.insts.push(IrInst::Assist { rip, next_rip });
+    }
+
+    /// Read the machine's timestamp counter. See [`IrInst::ReadTsc`].
+    pub fn read_tsc(&mut self) -> ValueId {
+        let dst = self.fresh(Width::W64);
+        self.insts.push(IrInst::ReadTsc { dst });
+        dst
+    }
+
+    pub fn zext(&mut self, width: Width, src: ValueId) -> ValueId {
+        let dst = self.fresh(width);
+        self.insts.push(IrInst::Zext { dst, src, width });
         dst
     }
 
@@ -668,6 +815,20 @@ impl IrBuilder {
     pub fn eval_cond(&mut self, cond: Cond) -> ValueId {
         let dst = self.fresh(Width::W8);
         self.insts.push(IrInst::EvalCond { dst, cond });
+        dst
+    }
+
+    /// Index of the lowest (`forward`) or highest set bit. Undefined for zero; see
+    /// [`IrInst::BitScan`].
+    #[must_use]
+    pub fn bitscan(&mut self, width: Width, src: ValueId, forward: bool) -> ValueId {
+        let dst = self.fresh(width);
+        self.insts.push(IrInst::BitScan {
+            dst,
+            src,
+            width,
+            forward,
+        });
         dst
     }
 

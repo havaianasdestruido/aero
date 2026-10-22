@@ -436,7 +436,10 @@ impl PciConfigSpace {
         // vector is masked). If a guest then performs a config-space write (for example, to unmask
         // MSI), `sync_capabilities_from_config()` below must see the up-to-date pending bits in the
         // byte array, otherwise it would clobber the device-managed fields.
-        self.sync_capabilities_to_config();
+        //
+        // Only the capability holding the bytes being written can matter here: the write is a
+        // read-modify-write of those bytes and nothing else.
+        self.sync_capabilities_to_config_range(offset, size);
 
         if (0x10..=0x27).contains(&offset) {
             // BAR writes must be 32-bit aligned accesses.
@@ -454,12 +457,19 @@ impl PciConfigSpace {
         let command_overlaps = offset < 0x06 && offset + size > 0x04;
         let old_command = if command_overlaps { self.command() } else { 0 };
 
+        // The read-only predicate is computed for the whole write before the loop, not
+        // per byte. It walks the capability list, makes a virtual call for each entry's
+        // offset and does a `downcast_ref::<MsiCapability>()` — and a `TypeId` compare is
+        // 16 bytes, so it shows up as `pcmpeqb`/`pmovmskb` in a profile. None of that
+        // depends on `i`: it reads capability state, and the loop only writes
+        // `self.bytes`. Doing it once instead of up to four times is most of what a
+        // config write used to cost.
+        let read_only = self.read_only_mask(offset, size);
         for i in 0..size {
-            let addr = offset + i;
-            if self.is_read_only_byte(addr) {
+            if read_only & (1 << i) != 0 {
                 continue;
             }
-            self.bytes[addr] = ((value >> (8 * i)) & 0xff) as u8;
+            self.bytes[offset + i] = ((value >> (8 * i)) & 0xff) as u8;
         }
 
         if command_overlaps {
@@ -472,7 +482,10 @@ impl PciConfigSpace {
             }
         }
 
-        self.sync_capabilities_from_config();
+        // Only the written capability can have changed from the config bytes.
+        self.sync_capabilities_from_config_range(offset, size);
+        // This one stays whole: a device may react to a write on one capability by
+        // changing state on another, and that has to reach the byte image.
         self.sync_capabilities_to_config();
 
         effects
@@ -707,6 +720,34 @@ impl PciConfigSpace {
         }
     }
 
+    /// Sync only the capabilities whose bytes overlap `[offset, offset + size)`.
+    ///
+    /// A config write reads and modifies just those bytes, so only the capability that
+    /// owns them needs its state reflected first — and syncing the rest is a virtual call
+    /// and a byte copy each, on a path taken millions of times a session. The *final*
+    /// sync after a write stays whole, because a device may react to one capability by
+    /// changing another.
+    fn sync_capabilities_to_config_range(&mut self, offset: usize, size: usize) {
+        for cap in &self.capabilities {
+            let base = cap.offset() as usize;
+            if offset < base + cap.len() as usize && base < offset + size {
+                cap.sync_to_config(&mut self.bytes);
+            }
+        }
+    }
+
+    /// As [`Self::sync_capabilities_to_config_range`], the other direction.
+    ///
+    /// Only a capability whose bytes the guest just wrote can have changed.
+    fn sync_capabilities_from_config_range(&mut self, offset: usize, size: usize) {
+        for cap in &mut self.capabilities {
+            let base = cap.offset() as usize;
+            if offset < base + cap.len() as usize && base < offset + size {
+                cap.sync_from_config(&mut self.bytes);
+            }
+        }
+    }
+
     fn sync_capabilities_from_config(&mut self) {
         for cap in &mut self.capabilities {
             cap.sync_from_config(&mut self.bytes);
@@ -746,7 +787,52 @@ impl PciConfigSpace {
         }
     }
 
-    fn is_read_only_byte(&self, addr: usize) -> bool {
+    /// Which of the `size` bytes at `offset` the guest may not change.
+    ///
+    /// Bit `i` corresponds to `offset + i`. Same answer as calling
+    /// [`Self::is_read_only_byte`] for each byte, with one pass over the capability list
+    /// instead of one per byte — see the caller for why that matters.
+    fn read_only_mask(&self, offset: usize, size: usize) -> u8 {
+        debug_assert!(size <= 4);
+        let mut mask = 0u8;
+        for i in 0..size {
+            if Self::is_static_read_only_byte(offset + i) {
+                mask |= 1 << i;
+            }
+        }
+        for cap in &self.capabilities {
+            let base = cap.offset() as usize;
+            // The capability ID and next-pointer bytes belong to the list, not the guest.
+            for i in 0..size {
+                let addr = offset + i;
+                if addr == base || addr == base + 1 {
+                    mask |= 1 << i;
+                }
+            }
+            // MSI pending bits are device-managed. Enforced here rather than inside
+            // `MsiCapability` so snapshot restore can still round-trip them through
+            // `PciConfigSpaceState::bytes`.
+            if let Some(msi) = cap
+                .as_any()
+                .downcast_ref::<crate::pci::msi::MsiCapability>()
+            {
+                if msi.per_vector_masking() {
+                    let pending_off = base + if msi.is_64bit() { 0x14 } else { 0x10 };
+                    for i in 0..size {
+                        let addr = offset + i;
+                        if addr >= pending_off && addr < pending_off + 4 {
+                            mask |= 1 << i;
+                        }
+                    }
+                }
+            }
+        }
+        mask
+    }
+
+    /// The read-only bytes that do not depend on which capabilities are present.
+    fn is_static_read_only_byte(addr: usize) -> bool {
+        // Vendor/device ID.
         if addr < 0x04 {
             return true;
         }
@@ -758,16 +844,15 @@ impl PciConfigSpace {
         if addr == usize::from(Self::HEADER_TYPE_OFFSET) {
             return true;
         }
-        // The Status register (0x06..=0x07) is largely read-only / RW1C on real hardware. Guests
-        // commonly perform 32-bit writes to the Command register at 0x04 and write zeros in the
-        // upper 16 bits; those writes must not clobber device-managed status bits such as the
-        // Capabilities List flag.
+        // The Status register (0x06..=0x07) is largely read-only / RW1C on real hardware.
+        // Guests commonly perform 32-bit writes to the Command register at 0x04 with
+        // zeros in the upper half; those must not clobber device-managed status bits such
+        // as the Capabilities List flag.
         if (PCI_STATUS_OFFSET..PCI_STATUS_OFFSET + 2).contains(&addr) {
             return true;
         }
-        // Interrupt Pin (0x3D) is read-only. Guests may perform 32-bit writes to Interrupt Line
-        // (0x3C) with zeros in the upper bytes; those writes must not clobber the device-reported
-        // pin.
+        // Interrupt Pin (0x3D) is read-only. Guests may write Interrupt Line (0x3C) as a
+        // dword with zeros above it; that must not clobber the device-reported pin.
         if addr == usize::from(Self::INTERRUPT_PIN_OFFSET) {
             return true;
         }
@@ -775,34 +860,7 @@ impl PciConfigSpace {
         if (0x2C..0x30).contains(&addr) {
             return true;
         }
-        if addr == PCI_CAP_PTR_OFFSET {
-            return true;
-        }
-
-        for cap in &self.capabilities {
-            let base = cap.offset() as usize;
-            if addr == base || addr == base + 1 {
-                return true;
-            }
-
-            // MSI pending bits are device-managed and read-only from the guest's perspective.
-            //
-            // We enforce this at the config-space write layer rather than inside `MsiCapability` so
-            // snapshot restore can still round-trip pending bits via `PciConfigSpaceState::bytes`.
-            if let Some(msi) = cap
-                .as_any()
-                .downcast_ref::<crate::pci::msi::MsiCapability>()
-            {
-                if msi.per_vector_masking() {
-                    let pending_off = base + if msi.is_64bit() { 0x14 } else { 0x10 };
-                    if addr >= pending_off && addr < pending_off + 4 {
-                        return true;
-                    }
-                }
-            }
-        }
-
-        false
+        addr == PCI_CAP_PTR_OFFSET
     }
 
     fn read_bar_register(&self, bar_index: usize) -> u32 {
@@ -1855,5 +1913,49 @@ mod tests {
         cfg.write(0x1c, 4, 0xFFFF_FFFF);
         assert_eq!(cfg.read(0x1c, 4), 0);
         assert_eq!(cfg.bar_range(3), None);
+    }
+}
+
+#[cfg(test)]
+mod read_only_mask_tests {
+    use super::*;
+
+    /// The read-only predicate moved out of the per-byte loop into a per-write pass, and
+    /// the two must agree byte for byte or a guest silently gains or loses the ability to
+    /// change a register. This pins the answers the old per-byte version gave.
+    #[test]
+    fn read_only_mask_matches_the_architectural_read_only_bytes() {
+        let cfg = PciConfigSpace::new(0x1234, 0x5678);
+
+        // Vendor/device ID, revision/class, header type, status, subsystem, cap pointer
+        // and interrupt pin are not the guest's to change.
+        for addr in [0x00usize, 0x03, 0x06, 0x07, 0x08, 0x0b, 0x0e, 0x2c, 0x2f, 0x3d] {
+            assert_eq!(
+                cfg.read_only_mask(addr, 1),
+                1,
+                "byte {addr:#04x} must be read-only"
+            );
+        }
+
+        // Command (0x04..0x06) and interrupt line (0x3c) are writable.
+        for addr in [0x04usize, 0x05, 0x3c] {
+            assert_eq!(
+                cfg.read_only_mask(addr, 1),
+                0,
+                "byte {addr:#04x} must be writable"
+            );
+        }
+    }
+
+    /// A dword write straddling writable and read-only bytes must report exactly the
+    /// read-only ones — this is the case the per-byte loop existed for, and the one a
+    /// hoisted version could plausibly get wrong.
+    #[test]
+    fn a_dword_write_reports_a_per_byte_mask() {
+        let cfg = PciConfigSpace::new(0x1234, 0x5678);
+        // 0x04..0x08 is command (writable) then status (read-only).
+        assert_eq!(cfg.read_only_mask(0x04, 4), 0b1100);
+        // 0x3c..0x40 is interrupt line (writable), pin (read-only), then two writable.
+        assert_eq!(cfg.read_only_mask(0x3c, 4) & 0b0011, 0b0010);
     }
 }

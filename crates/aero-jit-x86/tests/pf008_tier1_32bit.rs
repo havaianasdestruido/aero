@@ -62,7 +62,7 @@ fn collect_block_entries<B: Tier1Bus>(bus: &B, entry_rip: u64, bitness: u32) -> 
                     queue.push_back(fallthrough);
                 }
             }
-            InstKind::Ret => {}
+            InstKind::Ret { .. } => {}
             InstKind::Invalid => {
                 panic!("Tier-1 decode produced Invalid at 0x{rip:x}");
             }

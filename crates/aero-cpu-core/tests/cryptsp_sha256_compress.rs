@@ -24,8 +24,7 @@ const STATE: u64 = 0x2000;
 const BLOCK: u64 = 0x3000;
 
 const SHA256_IV: [u32; 8] = [
-    0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
-    0x5be0cd19,
+    0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
 ];
 
 fn k_table() -> [u32; 64] {
@@ -122,7 +121,10 @@ fn run_compress(state_words: [u32; 8], block: [u8; 64]) -> [u32; 8] {
         match res.exit {
             BatchExit::Halted => break,
             BatchExit::Completed | BatchExit::Branch => continue,
-            other => panic!("compress exit {other:?} after {steps} inst rip={:#x}", cpu.rip()),
+            other => panic!(
+                "compress exit {other:?} after {steps} inst rip={:#x}",
+                cpu.rip()
+            ),
         }
     }
     assert!(cpu.halted, "compress did not halt after {steps} inst");

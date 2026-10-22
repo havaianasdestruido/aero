@@ -37,8 +37,7 @@ fn tier1_can_compile_16bit_decode_mode_blocks() {
 
     let limits = BlockLimits {
         max_insts: 64,
-        max_bytes: 1024,
-    };
+        max_bytes: 1024, ..Default::default() };
     let options = Tier1WasmOptions::default();
 
     let compilation = compile_tier1_block_with_options(&bus, entry_rip, 16, limits, options)

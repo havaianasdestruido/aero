@@ -80,8 +80,7 @@ fn tier1_code_version_guard_ignores_trailing_invalid_page() {
 
         let mut compiler = Tier1Compiler::new(bus.clone(), NoopRegistry).with_limits(BlockLimits {
             max_insts: 16,
-            max_bytes: 64,
-        });
+            max_bytes: 64, ..Default::default() });
         let handle = compiler
             .compile_handle(&jit, entry, bitness)
             .expect("Tier-1 compile_handle");
@@ -140,8 +139,7 @@ fn tier1_code_version_guard_wraps_ip_across_bitness_boundary() {
 
         let mut compiler = Tier1Compiler::new(bus.clone(), NoopRegistry).with_limits(BlockLimits {
             max_insts: 16,
-            max_bytes: 64,
-        });
+            max_bytes: 64, ..Default::default() });
         let handle = compiler
             .compile_handle(&jit, entry, bitness)
             .expect("Tier-1 compile_handle");

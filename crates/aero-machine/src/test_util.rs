@@ -14,7 +14,13 @@ thread_local! {
 static PANIC_HOOK_LOCK: Mutex<()> = Mutex::new(());
 
 pub(crate) fn capture_panic_location(f: impl FnOnce()) -> (String, u32) {
-    let _guard = PANIC_HOOK_LOCK.lock().expect("panic hook lock poisoned");
+    // Poison-tolerant: this guard is held across the `assert!` that the expected panic
+    // happened, so one test failing here would otherwise make every other test using this
+    // helper fail with "panic hook lock poisoned" instead of its own result. The mutex
+    // guards `()`.
+    let _guard = PANIC_HOOK_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     LAST_PANIC_LOC.with(|cell| cell.borrow_mut().take());
     CAPTURE_PANIC_OUTPUT.with(|cell| cell.set(true));
     struct CaptureGuard;

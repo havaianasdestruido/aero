@@ -335,6 +335,20 @@ impl<'a> BlockLowerer<'a> {
 
     fn lower_inst(&mut self, inst: &IrInst) {
         match *inst {
+            // Tier-2 has no way to express a mid-trace exit, so a block with one
+            // deopts rather than being lowered with the exit quietly dropped.
+            IrInst::SideExit { .. } => {
+                self.unsupported = true;
+            }
+
+            // Tier-2 has no lowering for these yet; refusing the trace is the safe
+            // answer and keeps it interpreted rather than mis-lowered.
+            IrInst::Zext { .. }
+            | IrInst::ReadTsc { .. }
+            | IrInst::Assist { .. }
+            | IrInst::BitScan { .. } => {
+                self.unsupported = true;
+            }
             IrInst::Const { dst, value, .. } => {
                 self.instrs.push(Instr::Const {
                     dst: self.map_value(dst),
@@ -394,6 +408,11 @@ impl<'a> BlockLowerer<'a> {
     fn lower_read_reg(&mut self, dst: T1ValueId, reg: GuestReg) {
         let dst = self.map_value(dst);
         match reg {
+            // Tier-2 has no way to name a segment base, so a block that uses one
+            // deopts rather than being lowered with the base silently dropped.
+            GuestReg::SegBase(_) => {
+                self.unsupported = true;
+            }
             GuestReg::Rip => {
                 self.instrs.push(Instr::Const {
                     dst,
@@ -444,6 +463,10 @@ impl<'a> BlockLowerer<'a> {
 
     fn lower_write_reg(&mut self, reg: GuestReg, src: T1ValueId) {
         match reg {
+            // Tier-1 never emits one; see `lower_read_reg`.
+            GuestReg::SegBase(_) => {
+                self.unsupported = true;
+            }
             GuestReg::Rip => {
                 // Tier-2 does not currently model RIP as a first-class SSA value.
                 //

@@ -123,7 +123,11 @@ fn long_cpu() -> CpuCore {
     cpu
 }
 
-fn run<B: CpuBus>(cpu: &mut CpuCore, bus: &mut B, max: u64) -> aero_cpu_core::interp::tier0::exec::BatchResult {
+fn run<B: CpuBus>(
+    cpu: &mut CpuCore,
+    bus: &mut B,
+    max: u64,
+) -> aero_cpu_core::interp::tier0::exec::BatchResult {
     let mut ctx = AssistContext::default();
     let mut cfg = Tier0Config::from_cpuid(&ctx.features);
     cfg.exit_on_branch = false;

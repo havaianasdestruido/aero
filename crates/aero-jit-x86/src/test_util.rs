@@ -14,7 +14,15 @@ thread_local! {
 static PANIC_HOOK_LOCK: Mutex<()> = Mutex::new(());
 
 pub(crate) fn capture_panic_location(f: impl FnOnce()) -> (String, u32) {
-    let _guard = PANIC_HOOK_LOCK.lock().expect("panic hook lock poisoned");
+    // Poison-tolerant on purpose. The `assert!` below runs while this guard is held, so a
+    // test whose expected panic does not happen poisons the lock on its way out — and then
+    // every *other* test using this helper fails with "panic hook lock poisoned" instead of
+    // its own result. One real failure was reporting as up to five, varying with thread
+    // scheduling, which is worse than useless when the suite is being used to decide whether
+    // a change regressed anything. The mutex guards `()`; there is no invariant to protect.
+    let _guard = PANIC_HOOK_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     LAST_PANIC_LOC.with(|cell| cell.borrow_mut().take());
     CAPTURE_PANIC_OUTPUT.with(|cell| cell.set(true));
     struct CaptureGuard;

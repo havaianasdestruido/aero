@@ -185,6 +185,11 @@ fn update_shift_flags(
     if flags.contains(FlagSet::PF) {
         write_flag(cpu, Flag::Pf, parity_even(result as u8));
     }
+    // AF is undefined here; Tier-0 clears it, so match that rather than leaving a
+    // value the other tier would not have produced.
+    if flags.contains(FlagSet::AF) {
+        write_flag(cpu, Flag::Af, false);
+    }
 
     // CF is defined for shift counts in the range [1, width.bits()]. For counts above the operand
     // width, CF is architecturally undefined; we conservatively leave it unchanged.
@@ -259,6 +264,9 @@ pub struct TestCpu {
     pub gpr: [u64; abi::GPR_COUNT],
     pub rip: u64,
     pub rflags: u64,
+    /// Read-only here; `fs:`/`gs:` addressing needs them, nothing writes them.
+    pub fs_base: u64,
+    pub gs_base: u64,
 }
 
 impl Default for TestCpu {
@@ -267,6 +275,8 @@ impl Default for TestCpu {
             gpr: [0; abi::GPR_COUNT],
             rip: 0,
             rflags: abi::RFLAGS_RESERVED1,
+            fs_base: 0,
+            gs_base: 0,
         }
     }
 }
@@ -293,11 +303,25 @@ impl TestCpu {
         buf.copy_from_slice(&mem[rip_off..rip_off + 8]);
         let rip = u64::from_le_bytes(buf);
 
+        let read_u64 = |off: usize| -> u64 {
+            let mut b = [0u8; 8];
+            b.copy_from_slice(&mem[off..off + 8]);
+            u64::from_le_bytes(b)
+        };
+        let fs_base = read_u64(abi::CPU_FS_BASE_OFF as usize);
+        let gs_base = read_u64(abi::CPU_GS_BASE_OFF as usize);
+
         let rflags_off = abi::CPU_RFLAGS_OFF as usize;
         buf.copy_from_slice(&mem[rflags_off..rflags_off + 8]);
         let rflags = u64::from_le_bytes(buf);
 
-        Self { gpr, rip, rflags }
+        Self {
+            gpr,
+            rip,
+            rflags,
+            fs_base,
+            gs_base,
+        }
     }
 
     /// Writes this [`TestCpu`] into a canonical `CpuState` ABI byte buffer.
@@ -327,6 +351,8 @@ impl TestCpu {
             gpr: cpu.gpr,
             rip: cpu.rip,
             rflags: cpu.rflags_snapshot(),
+            fs_base: cpu.msr.fs_base,
+            gs_base: cpu.msr.gs_base,
         }
     }
 
@@ -372,10 +398,41 @@ pub fn execute_block_cpu<B: Tier1Bus>(
     cpu: &mut TestCpu,
     bus: &mut B,
 ) -> ExecResult {
-    let mut temps = vec![0u64; block.value_types.len()];
+    let mut temps = Vec::new();
+    execute_block_cpu_with_scratch(block, cpu, bus, &mut temps)
+}
+
+/// Execute a block reusing a caller-owned value buffer.
+///
+/// The buffer holds one entry per IR value, so it has to be sized per block —
+/// which, allocated here, is a zeroing `calloc` and a `free` on *every block
+/// execution*. That is a few dozen bytes at a time and it showed up as ~3% of a
+/// profile spent in the allocator, on a path whose whole purpose is to be cheaper
+/// than interpreting the same instructions one at a time.
+///
+/// Callers that execute blocks in a loop (a chain, most importantly) should hoist
+/// one buffer out of the loop and pass it here: after the first block it is a
+/// capacity check and a memset rather than a trip to the allocator.
+pub fn execute_block_cpu_with_scratch<B: Tier1Bus>(
+    block: &IrBlock,
+    cpu: &mut TestCpu,
+    bus: &mut B,
+    temps: &mut Vec<u64>,
+) -> ExecResult {
+    temps.clear();
+    temps.resize(block.value_types.len(), 0);
+    let temps = &mut temps[..];
 
     for inst in &block.insts {
         match inst {
+            // The taken path leaves the block; the fall-through carries on with the
+            // guest registers still in temporaries.
+            IrInst::SideExit { cond, target } => {
+                if temps[cond.0 as usize] != 0 {
+                    cpu.rip = *target;
+                    return ExecResult::ExitToInterpreter { next_rip: *target };
+                }
+            }
             IrInst::Const { dst, value, width } => {
                 temps[dst.0 as usize] = width.truncate(*value);
             }
@@ -384,6 +441,7 @@ pub fn execute_block_cpu<B: Tier1Bus>(
                     GuestReg::Rip => cpu.rip,
                     GuestReg::Gpr { reg, width, high8 } => read_gpr_part(cpu, reg, width, high8),
                     GuestReg::Flag(flag) => read_flag(cpu, flag) as u64,
+                    GuestReg::SegBase(seg) => read_seg_base(cpu, seg),
                 };
                 temps[dst.0 as usize] = v;
             }
@@ -395,9 +453,35 @@ pub fn execute_block_cpu<B: Tier1Bus>(
                         write_gpr_part(cpu, reg, width, high8, v)
                     }
                     GuestReg::Flag(flag) => write_flag(cpu, flag, v != 0),
+                    // The IR never emits one: a segment base changes only through
+                    // instructions Tier-1 declines to translate.
+                    GuestReg::SegBase(_) => unreachable!("segment bases are read-only in Tier-1"),
                 }
             }
             IrInst::Trunc { dst, src, width } => {
+                let v = temps[src.0 as usize];
+                temps[dst.0 as usize] = width.truncate(v);
+            }
+            IrInst::BitScan {
+                dst,
+                src,
+                width,
+                forward,
+            } => {
+                // Undefined for a zero source, and the translator never uses the
+                // result there — it selects the destination's old value, which is what
+                // Tier-0's `exec_bsf_bsr` does. Mirror `63 - leading_zeros` exactly.
+                let v = temps[src.0 as usize];
+                let idx = if *forward {
+                    u64::from(v.trailing_zeros())
+                } else {
+                    63u64.wrapping_sub(u64::from(v.leading_zeros()))
+                };
+                temps[dst.0 as usize] = width.truncate(idx);
+            }
+            IrInst::Zext { dst, src, width } => {
+                // A narrow value is already stored with its high bits clear, so
+                // widening it is re-typing rather than any actual work.
                 let v = temps[src.0 as usize];
                 temps[dst.0 as usize] = width.truncate(v);
             }
@@ -517,7 +601,17 @@ pub fn execute_block_cpu<B: Tier1Bus>(
                 temps[dst.0 as usize] = res;
                 if !flags.is_empty() {
                     if let Some(vals) = flag_vals {
-                        write_flagset(cpu, *flags, vals);
+                        // `imul` defines CF and OF and leaves SF, ZF, AF and PF as
+                        // they were — undefined architecturally, and untouched by
+                        // Tier-0, which is the behaviour the compiled tier has to
+                        // match. Honouring a wider declared set here would make the
+                        // IR mean two different things depending on who ran it.
+                        let written = if matches!(op, BinOp::Mul) {
+                            flags.intersect(FlagSet::CF.union(FlagSet::OF))
+                        } else {
+                            *flags
+                        };
+                        write_flagset(cpu, written, vals);
                     } else if matches!(op, BinOp::Shl | BinOp::Shr | BinOp::Sar) {
                         update_shift_flags(cpu, w, *op, l, shift_amt, res, *flags);
                     } else if matches!(op, BinOp::Rol | BinOp::Ror) {
@@ -563,6 +657,18 @@ pub fn execute_block_cpu<B: Tier1Bus>(
                 let t = temps[if_true.0 as usize];
                 let e = temps[if_false.0 as usize];
                 temps[dst.0 as usize] = width.truncate(if c { t } else { e });
+            }
+            IrInst::Assist { rip, .. } => {
+                // No machine here to perform it; this interpreter exists to validate
+                // x86 -> IR translation, and the assist's effect is the host's.
+                return ExecResult::ExitToInterpreter { next_rip: *rip };
+            }
+            IrInst::ReadTsc { dst } => {
+                // This interpreter exists to validate x86 -> IR translation and has
+                // no machine to ask, so it reports zero. A timestamp cannot be
+                // compared against a second execution in any case, which is why
+                // blocks that read one are excluded from the runtime verifier too.
+                temps[dst.0 as usize] = 0;
             }
             IrInst::CallHelper { .. } => {
                 // The Tier-1 debug interpreter is only used to validate x86→IR translation. It has
@@ -659,6 +765,14 @@ fn flag_mask(flag: Flag) -> u64 {
         Flag::Zf => RFLAGS_ZF,
         Flag::Sf => RFLAGS_SF,
         Flag::Of => RFLAGS_OF,
+    }
+}
+
+#[inline]
+fn read_seg_base(cpu: &TestCpu, seg: crate::tier1::ir::SegBase) -> u64 {
+    match seg {
+        crate::tier1::ir::SegBase::Fs => cpu.fs_base,
+        crate::tier1::ir::SegBase::Gs => cpu.gs_base,
     }
 }
 

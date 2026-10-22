@@ -27,6 +27,12 @@ mod aerogpu_legacy_text;
 mod guest_time;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod jit;
+pub mod rip_map;
+// The tier itself is engine-agnostic and compiles everywhere; only the Wasmtime
+// aliases inside it are native.
+pub mod compiled_tier;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod jit_ram;
 
 /// The IR block cache threaded through the execute loop.
 ///
@@ -40,6 +46,21 @@ pub type RunSliceIrJit = jit::IrBlockCache;
 /// See [`RunSliceIrJit`]. Uninhabited on wasm32, where there is no block cache.
 #[cfg(target_arch = "wasm32")]
 pub enum RunSliceIrJit {}
+
+/// The compiled tier as the run loop names it.
+///
+/// The tier itself builds for the browser, but the *native* one is bound to Wasmtime,
+/// so the loop's signature needs a name that exists on both targets. Same shape as
+/// [`RunSliceIrJit`]: uninhabited on wasm32, so the `Option` is always `None` there
+/// and the paths that would use it fold away.
+#[cfg(not(target_arch = "wasm32"))]
+pub type RunSliceCompiledTier = compiled_tier::NativeCompiledTier;
+
+/// See [`RunSliceCompiledTier`]. The browser has no engine wired up yet, so this
+/// names a tier over a backend that admits nothing; the `Option` is always `None`.
+#[cfg(target_arch = "wasm32")]
+pub type RunSliceCompiledTier =
+    compiled_tier::CompiledTier<aero_jit_x86::compiled_backend::NullCompiledBackend>;
 mod shared_disk;
 mod shared_iso_disk;
 mod vcpu_init;
@@ -65,7 +86,9 @@ use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use aero_cpu_core::assist::AssistContext;
-use aero_cpu_core::interp::tier0::exec::{run_batch_cpu_core_with_assists, BatchExit};
+use aero_cpu_core::interp::tier0::exec::{
+    run_batch_cpu_core_with_assists, run_batch_cpu_core_with_assists_seamed, BatchExit,
+};
 use aero_cpu_core::interp::tier0::Tier0Config;
 use aero_cpu_core::interrupts::CpuExit;
 use aero_cpu_core::state::{gpr, CpuMode, CpuState, RFLAGS_IF};
@@ -1348,6 +1371,16 @@ impl FirmwareMemory for SystemMemory {
 
 impl memory::MemoryBus for SystemMemory {
     #[inline]
+    fn is_ram(&mut self, paddr: u64) -> bool {
+        self.bus.is_ram(paddr)
+    }
+
+    #[inline]
+    fn read_insn_window(&mut self, paddr: u64) -> [u8; 15] {
+        self.bus.read_insn_window(paddr)
+    }
+
+    #[inline]
     fn read_physical(&mut self, paddr: u64, buf: &mut [u8]) {
         self.bus.read_physical(paddr, buf);
     }
@@ -1809,6 +1842,29 @@ impl<'a> PerCpuSystemMemoryBus<'a> {
 
 impl memory::MemoryBus for PerCpuSystemMemoryBus<'_> {
     #[inline]
+    fn is_ram(&mut self, paddr: u64) -> bool {
+        self.mem.is_ram(paddr)
+    }
+
+    #[inline]
+    fn read_insn_window(&mut self, paddr: u64) -> [u8; 15] {
+        // Instruction fetch never targets the LAPIC window, but check anyway so the
+        // fast path is a property of the address rather than an assumption about
+        // the caller; the fallback keeps the LAPIC-splitting logic in one place.
+        let lapic_start = LAPIC_MMIO_BASE;
+        let lapic_end = LAPIC_MMIO_BASE + LAPIC_MMIO_SIZE;
+        if self.interrupts.is_none()
+            || paddr
+                .checked_add(15)
+                .is_some_and(|end| end <= lapic_start || paddr >= lapic_end)
+        {
+            return self.mem.read_insn_window(paddr);
+        }
+        let mut buf = [0u8; 15];
+        self.read_physical(paddr, &mut buf);
+        buf
+    }
+
     fn read_physical(&mut self, mut paddr: u64, buf: &mut [u8]) {
         if buf.is_empty() {
             return;
@@ -2009,6 +2065,16 @@ impl memory::MemoryBus for PerCpuSystemMemoryBus<'_> {
 }
 
 impl aero_mmu::MemoryBus for PerCpuSystemMemoryBus<'_> {
+    #[inline]
+    fn is_ram(&mut self, paddr: u64) -> bool {
+        memory::MemoryBus::is_ram(self, paddr)
+    }
+
+    #[inline]
+    fn read_insn_window(&mut self, paddr: u64) -> [u8; 15] {
+        memory::MemoryBus::read_insn_window(self, paddr)
+    }
+
     #[inline]
     fn read_u8(&mut self, paddr: u64) -> u8 {
         memory::MemoryBus::read_u8(self, paddr)
@@ -2251,6 +2317,16 @@ impl aero_cpu_core::mem::CpuBus for MachineCpuBus<'_> {
             return Err(Exception::Unimplemented("reset requested"));
         }
         self.inner.fetch(vaddr, max_len)
+    }
+
+    #[inline]
+    fn jit_translate(&mut self, vaddr: u64, write: bool) -> Option<(u64, bool)> {
+        self.inner.jit_translate(vaddr, write)
+    }
+
+    #[inline]
+    fn jit_tlb_generation(&mut self) -> u64 {
+        self.inner.jit_tlb_generation()
     }
 
     #[inline]
@@ -5348,7 +5424,14 @@ pub struct Machine {
     cpu: CpuCore,
     ap_cpus: Vec<CpuCore>,
     assist: AssistContext,
-    mmu: aero_mmu::Mmu,
+    /// The durable MMU, warm across batches — `None` only while a bus holds it.
+    ///
+    /// Lending it out rather than swapping a placeholder in is what keeps the
+    /// outer loop free of MMU-sized copies: `Mmu` is 16.5KB, and building one per
+    /// boundary just to have something to swap against cost six multi-kilobyte
+    /// `memmove`s each time. A path that forgets to hand it back gets a fresh cold
+    /// MMU next boundary, exactly as a missed swap did before.
+    mmu: Option<Box<aero_mmu::Mmu>>,
     mem: SystemMemory,
     io: IoPortBus,
 
@@ -5541,6 +5624,14 @@ pub enum ScanoutSource {
     Wddm,
 }
 
+/// Hardware-virtualisation backend (Linux, `/dev/kvm`). See `kvm.rs`.
+#[cfg(all(target_os = "linux", not(target_arch = "wasm32")))]
+pub mod kvm;
+
+/// The execution mode built on [`kvm`]: owns the exit loop and the guest's clock.
+#[cfg(all(target_os = "linux", not(target_arch = "wasm32")))]
+pub mod kvm_mode;
+
 impl Machine {
     /// Return the machine's immutable configuration.
     ///
@@ -5688,7 +5779,7 @@ impl Machine {
             cpu: CpuCore::new(CpuMode::Real),
             ap_cpus: Vec::new(),
             assist: AssistContext::default(),
-            mmu: aero_mmu::Mmu::new(),
+            mmu: Some(Box::new(aero_mmu::Mmu::new())),
             busy_tick_instructions: 0,
             mem,
             io: IoPortBus::new(),
@@ -9229,10 +9320,37 @@ impl Machine {
     /// knob. It is bounded on the other side by responsiveness: a guest wait that
     /// spins on a platform timer only makes progress across a boundary, so an
     /// oversized batch can stall calibration waits.
+    /// Guest instructions per outer-loop batch.
+    ///
+    /// Every batch boundary re-polls devices, rebuilds the paging bus and checks for
+    /// interrupts, and that costs **~35,000-42,000 host instructions** — measured two
+    /// ways that agree: raising this from 1,024 to 4,096 saves 26 host instructions
+    /// per guest instruction under the interpreter and 30.6 under the compiled tier,
+    /// and those imply the same per-batch figure from two very different per-
+    /// instruction costs.
+    ///
+    /// It matters far more to the compiled tier, because its own per-instruction cost
+    /// is low enough that this fixed overhead is a large share of it: steady state
+    /// **182.2 to 151.6, 17%**. Whole session 397.2 to 365.4, warm-up 827.0 to 793.2.
+    ///
+    /// 4,096 and not more: the value has to stay small enough that platform timers
+    /// tick and IRQs are polled inside a timestamp-bounded wait — 16,384 once let a
+    /// HAL 0x5C clock-sync wait expire entirely within one batch. At 4,096 the guest
+    /// executes *identically* to 1,024 through 20M instructions, and the compiled
+    /// tier's working set is unchanged (60,016 blocks against 60,144, coverage within
+    /// 0.002%), which is the evidence that this is doing less work rather than
+    /// different work. 8,192 is also identical at 20M but its working set has moved
+    /// by 200M, so it is not taken.
+    /// See the call site in `run_slice_inner`.
+    fn double_poll_devices_impl() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("AERO_DOUBLE_POLL").is_some())
+    }
+
     fn batch_inst_quantum() -> u64 {
         static QUANTUM: OnceLock<u64> = OnceLock::new();
         *QUANTUM.get_or_init(|| {
-            const DEFAULT: u64 = 1_024;
+            const DEFAULT: u64 = 4_096;
             let n = std::env::var("AERO_BATCH_INSTS")
                 .ok()
                 .and_then(|s| s.parse().ok())
@@ -12860,7 +12978,7 @@ impl Machine {
         }
         self.ap_cpus = ap_cpus;
         self.guest_time = GuestTime::new_from_cpu(&self.cpu);
-        self.mmu = aero_mmu::Mmu::new();
+        self.mmu = Some(Box::new(aero_mmu::Mmu::new()));
 
         // Run firmware POST (in Rust) to initialize IVT/BDA, map BIOS stubs, and load the boot
         // sector into RAM.
@@ -13687,9 +13805,11 @@ impl Machine {
                 ApCpus::Split { before, after },
                 &mut self.mem,
             );
-            let mut inner =
-                aero_cpu_core::PagingBus::new_with_io(phys, StrictIoPortBus { io: &mut self.io });
-            std::mem::swap(&mut self.mmu, inner.mmu_mut());
+            let inner = aero_cpu_core::PagingBus::with_boxed_mmu_and_io(
+                Self::take_mmu(&mut self.mmu),
+                phys,
+                StrictIoPortBus { io: &mut self.io },
+            );
             let mut bus = MachineCpuBus {
                 a20: self.chipset.a20(),
                 reset: self.reset_latch.clone(),
@@ -13699,13 +13819,20 @@ impl Machine {
 
             let _ =
                 run_batch_cpu_core_with_assists(cfg, &mut self.assist, cpu, &mut bus, max_insts);
-            std::mem::swap(&mut self.mmu, bus.inner.mmu_mut());
+            self.mmu = Some(bus.inner.into_boxed_mmu_and_phys().0);
         }
     }
 
     /// Run the CPU for at most `max_insts` guest instructions.
     pub fn run_slice(&mut self, max_insts: u64) -> RunExit {
-        self.run_slice_inner(max_insts, None)
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.run_slice_inner(max_insts, None, None)
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.run_slice_inner(max_insts, None, None)
+        }
     }
 
     /// Run with IR-block JIT acceleration. Hot blocks are pre-decoded to IR and
@@ -13714,7 +13841,49 @@ impl Machine {
     #[doc(hidden)]
     #[cfg(not(target_arch = "wasm32"))]
     pub fn run_slice_jit(&mut self, max_insts: u64, ir_jit: &mut RunSliceIrJit) -> RunExit {
-        self.run_slice_inner(max_insts, Some(ir_jit))
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.run_slice_inner(max_insts, Some(ir_jit), None)
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.run_slice_inner(max_insts, Some(ir_jit))
+        }
+    }
+
+    /// Run a slice with the compiled Tier-1 tier driving hot blocks.
+    ///
+    /// Entry is at the outer-loop boundary, the same place the IR chain has always
+    /// been entered from — the surroundings there are known good, and a chain can
+    /// cover far more than one batch's worth of instructions from a single entry.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn run_slice_compiled(
+        &mut self,
+        max_insts: u64,
+        tier: &mut RunSliceCompiledTier,
+    ) -> RunExit {
+        self.run_slice_inner(max_insts, None, Some(tier))
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn skip_device_polls() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("AERO_NO_POLL").is_some())
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn skip_device_polls() -> bool {
+        false
+    }
+
+    /// Borrow the durable MMU for a batch.
+    ///
+    /// The `None` case means a previous batch exited without handing it back. That
+    /// costs a cold TLB for one batch, which is what the old swap-a-placeholder
+    /// idiom also did, so it is not worth a panic.
+    fn take_mmu(slot: &mut Option<Box<aero_mmu::Mmu>>) -> Box<aero_mmu::Mmu> {
+        slot.take()
+            .unwrap_or_else(|| Box::new(aero_mmu::Mmu::new()))
     }
 
     fn run_slice_inner(
@@ -13724,6 +13893,9 @@ impl Machine {
         // paths below are compiled in. On wasm32 the cache type is uninhabited, so this is
         // always `None` and nothing reads it.
         #[allow(unused_mut, unused_variables)] mut ir_jit: Option<&mut RunSliceIrJit>,
+        // Always named, never inhabited on wasm32 — see `RunSliceCompiledTier`.
+        // Gating the parameter itself instead leaves the uses below unguarded.
+        #[allow(unused_mut, unused_variables)] mut compiled: Option<&mut RunSliceCompiledTier>,
     ) -> RunExit {
         let mut executed = 0u64;
         // Keep Tier-0 instruction gating coherent with the CPUID surface that assists expose to the
@@ -13736,7 +13908,8 @@ impl Machine {
         cfg.exit_on_branch = false;
         // Keep batches modest so RDTSC-accelerated waits still cross outer-loop
         // boundaries where platform timers tick and IRQs are polled. 16k let a
-        // HAL 0x5C clock-sync wait expire entirely inside one batch.
+        // HAL 0x5C clock-sync wait expire entirely inside one batch. See
+        // `batch_inst_quantum` for what a boundary costs and why 4,096 is the value.
         let batch_inst_quantum = Self::batch_inst_quantum();
         while executed < max_insts {
             if let Some(kind) = self.reset_latch.take() {
@@ -13758,17 +13931,39 @@ impl Machine {
             //
             // AHCI completes DMA asynchronously and signals completion via interrupts; those
             // interrupts must be able to wake a HLT'd CPU.
-            self.process_ahci();
-            self.process_nvme();
-            self.process_virtio_blk();
-            self.process_aerogpu();
-            self.process_virtio_input();
-
-            self.poll_network();
-            self.process_ahci();
-            self.process_nvme();
-            self.process_virtio_blk();
-            self.process_aerogpu();
+            //
+            // Every boundary, and measured: a poll costs ~1,500 host instructions whether
+            // or not the controller has anything to do, so polling this group every eighth
+            // boundary instead looks like an easy saving. It is not one — 153.4 against
+            // 150.1 host instructions per guest instruction — and part of that is the guest
+            // doing different work once completions are delayed (compiled coverage moved
+            // 188.21M to 187.19M), which makes the comparison worth less than it looks.
+            // Either way there is nothing here.
+            // `AERO_NO_POLL=1` skips the device polls entirely. Diagnostic only, and
+            // it does *not* bound what making an idle poll cheap would be worth:
+            // measured at 393.7 host instructions per guest instruction against 116.0,
+            // because a guest whose storage completions never arrive spins waiting for
+            // them and does entirely different work. Kept because that is worth
+            // knowing before someone tries the same shortcut again.
+            if !Self::skip_device_polls() {
+                self.process_ahci();
+                self.process_nvme();
+                self.process_virtio_blk();
+                self.process_aerogpu();
+                self.process_virtio_input();
+                self.poll_network();
+            }
+            // The storage and GPU controllers were polled a few lines up. Polling them
+            // again after the *network* poll is duplication, not sequencing: nothing
+            // `poll_network` does gives AHCI, NVMe, virtio-blk or the GPU new work.
+            // A boundary costs ~35,000-42,000 host instructions and these are four of
+            // the thirteen polls in it. `AERO_DOUBLE_POLL=1` restores them.
+            if Self::double_poll_devices_impl() {
+                self.process_ahci();
+                self.process_nvme();
+                self.process_virtio_blk();
+                self.process_aerogpu();
+            }
             self.process_ide();
 
             // Poll the platform interrupt controller (PIC/IOAPIC+LAPIC) and enqueue at most one
@@ -13802,21 +13997,20 @@ impl Machine {
             // scheduling can pass the correct APIC ID when additional `CpuCore` instances are
             // introduced.
             //
-            // Hand the durable MMU (warm TLB) into the paging bus. Use swap against a
-            // stack-local empty MMU so we never leave `self.mmu` in a partially-moved
-            // state; the empty one is discarded when the batch ends.
+            // Lend the durable MMU (warm TLB) to the paging bus for the batch. It is
+            // handed back at every exit below; a path that misses one starts the next
+            // batch on a fresh cold MMU rather than leaving anything inconsistent.
             let phys = PerCpuSystemMemoryBus::new(
                 0,
                 self.interrupts.clone(),
                 ApCpus::All(self.ap_cpus.as_mut_slice()),
                 &mut self.mem,
             );
-            let mut inner = aero_cpu_core::PagingBus::with_mmu_and_io(
-                aero_mmu::Mmu::new(),
+            let inner = aero_cpu_core::PagingBus::with_boxed_mmu_and_io(
+                Self::take_mmu(&mut self.mmu),
                 phys,
                 StrictIoPortBus { io: &mut self.io },
             );
-            std::mem::swap(&mut self.mmu, inner.mmu_mut());
             let mut bus = MachineCpuBus {
                 a20: self.chipset.a20(),
                 reset: self.reset_latch.clone(),
@@ -13834,6 +14028,43 @@ impl Machine {
             // multiple wraps. TimeSource's monotonic counter advances for instructions and
             // explicit quanta but is intentionally unaffected by architectural TSC writes.
             let elapsed_cycles_before = self.cpu.time.elapsed_cycles();
+
+            // Diagnostic: prove the JIT translation path answers against the
+            // guest's real page tables, not just a synthetic harness.
+            #[cfg(not(target_arch = "wasm32"))]
+            if std::env::var_os("AERO_JIT_XLAT_PROBE").is_some() {
+                use std::sync::atomic::{AtomicU64, Ordering};
+                static PROBES: AtomicU64 = AtomicU64::new(0);
+                let n = PROBES.fetch_add(1, Ordering::Relaxed);
+                if n < 8 {
+                    aero_cpu_core::mem::CpuBus::sync(&mut bus, &self.cpu.state);
+                    let rip = self.cpu.state.rip();
+                    match aero_cpu_core::mem::CpuBus::jit_translate(&mut bus, rip, false) {
+                        Some((page, is_ram)) => eprintln!(
+                            "AERO_JIT_XLAT: rip={rip:#x} -> phys_page={page:#x} is_ram={is_ram}"
+                        ),
+                        None => eprintln!("AERO_JIT_XLAT: rip={rip:#x} -> no mapping"),
+                    }
+                }
+            }
+
+            // ── Compiled Tier-1 fast-path ────────────────────────────────────
+            // A chain is entered only with no event owed: it runs many blocks
+            // without consulting the interrupt controller, and Tier-0's loop head is
+            // where delivery happens.
+            #[allow(unused_mut)]
+            let mut compiled_executed = 0u64;
+            #[cfg(not(target_arch = "wasm32"))]
+            if !self.cpu.pending.has_pending_event()
+                && self.cpu.pending.external_interrupts().is_empty()
+            {
+                if let Some(ref mut tier) = compiled {
+                    if tier.has_block(self.cpu.state.rip()) {
+                        compiled_executed =
+                            tier.run(&mut self.cpu, &mut bus, &mut self.assist, remaining);
+                    }
+                }
+            }
 
             // ── IR block JIT fast-path ───────────────────────────────────────
             // Check if a hot block is cached for the current RIP. If so,
@@ -13871,17 +14102,61 @@ impl Machine {
                                 .retire_instructions(guest_instruction_count);
                             ir_executed = guest_instruction_count;
                             jit.record_chain_execution(blocks, guest_instruction_count);
+
+                            // Grow the cache along the chain.
+                            //
+                            // A chain stops for one of two reasons: it ran out of
+                            // budget at a block that *is* cached, or it walked off the
+                            // edge of the cache at one that is not. In the second case
+                            // `next_rip` is exactly the successor we were missing, and
+                            // reaching it by executing cached blocks is strong evidence
+                            // it is hot — much stronger than the batch-boundary sample
+                            // below, which lands on whatever RIP the instruction budget
+                            // happened to expire at.
+                            //
+                            // Without this the outer loop `continue`s straight past the
+                            // hotness block whenever the chain runs, so the cache could
+                            // only ever grow from those arbitrary batch-end samples:
+                            // 230 blocks over 100M instructions, and chains that died
+                            // after ~0.4 blocks because their successors were never
+                            // compiled.
+                            //
+                            // `record_hit` already returns false for RIPs that are
+                            // cached, in flight, or previously rejected, so the
+                            // budget-exhausted case costs a counter bump.
+                            if jit.record_chain_miss(next_rip) {
+                                let bitness = self.cpu.state.bitness();
+                                let _ = jit.compile(next_rip, bitness, &mut bus);
+                            }
                         }
                     }
                 }
             }
 
-            let batch = if ir_executed > 0 {
+            let batch = if compiled_executed > 0 {
+                // Same post-chain bookkeeping the IR path does: hand the warm MMU
+                // back, tick platform timers by what the chain consumed, then go
+                // round the outer loop so devices are re-polled.
+                self.mmu = Some(bus.inner.into_boxed_mmu_and_phys().0);
+                let elapsed_cycles = self
+                    .cpu
+                    .time
+                    .elapsed_cycles()
+                    .wrapping_sub(elapsed_cycles_before);
+                self.tick_platform_from_cycles(elapsed_cycles.max(compiled_executed));
+                executed = executed.saturating_add(compiled_executed);
+                if let Some(kind) = self.reset_latch.take() {
+                    self.flush_serial();
+                    return RunExit::ResetRequested { kind, executed };
+                }
+                self.run_ap_cpus(&cfg, remaining.min(compiled_executed));
+                continue;
+            } else if ir_executed > 0 {
                 // IR block succeeded; skip the interpreter batch for this iteration.
                 // Return the warm, synchronized MMU to the machine before the
                 // stack-local bus is dropped. Losing it here made the next
                 // cached block start from a default (paging-disabled) MMU.
-                std::mem::swap(&mut self.mmu, bus.inner.mmu_mut());
+                self.mmu = Some(bus.inner.into_boxed_mmu_and_phys().0);
                 // Tick platform timers by the IR block's instruction count.
                 let elapsed_cycles = self
                     .cpu
@@ -13897,6 +14172,29 @@ impl Machine {
                 }
                 self.run_ap_cpus(&cfg, remaining.min(ir_executed));
                 continue;
+            } else if let Some(ref mut tier) = compiled {
+                // Interpreter batch with the compiled tier offered every taken
+                // branch, so a chain is entered wherever control reaches one rather
+                // than only if the instruction budget happens to expire on it.
+                if crate::compiled_tier::seam_enabled() {
+                    let mut seam = crate::compiled_tier::seam_for(&bus, tier);
+                    run_batch_cpu_core_with_assists_seamed(
+                        &cfg,
+                        &mut self.assist,
+                        &mut self.cpu,
+                        &mut bus,
+                        remaining,
+                        Some(&mut seam),
+                    )
+                } else {
+                    run_batch_cpu_core_with_assists(
+                        &cfg,
+                        &mut self.assist,
+                        &mut self.cpu,
+                        &mut bus,
+                        remaining,
+                    )
+                }
             } else {
                 // Normal interpreter batch.
                 run_batch_cpu_core_with_assists(
@@ -13907,6 +14205,16 @@ impl Machine {
                     remaining,
                 )
             };
+
+            // ── Compiled tier hotness ────────────────────────────────────────
+            #[cfg(not(target_arch = "wasm32"))]
+            if let Some(ref mut tier) = compiled {
+                let rip = self.cpu.state.rip();
+                if tier.record_hit(rip) {
+                    let bitness = self.cpu.state.bitness();
+                    let _ = tier.compile(rip, bitness, &mut bus);
+                }
+            }
 
             // ── Hotness tracking ─────────────────────────────────────────────
             #[cfg(not(target_arch = "wasm32"))]
@@ -13919,7 +14227,7 @@ impl Machine {
                 }
             }
 
-            std::mem::swap(&mut self.mmu, bus.inner.mmu_mut());
+            self.mmu = Some(bus.inner.into_boxed_mmu_and_phys().0);
             executed = executed.saturating_add(batch.executed);
 
             let elapsed_cycles = self
@@ -14779,6 +15087,55 @@ impl Machine {
                 }
             }
         }
+    }
+
+    /// Whether a vector is waiting for `cpu_index`, without acknowledging it.
+    ///
+    /// Pairs with [`Self::take_external_interrupt_vector`]: a backend that has to arrange
+    /// for delivery before it can accept one — KVM asks for an interrupt window and waits
+    /// for the guest to open it — needs to know something is there without consuming it.
+    /// Whether a vector is pending depends on the task priority, so `cr8` is synced into
+    /// the LAPIC first, exactly as the polling path does.
+    pub fn peek_external_interrupt_vector(&mut self, cpu_index: usize, cr8: u64) -> Option<u8> {
+        // Level-triggered PCI INTx lines have to be resynced even when nothing is
+        // deliverable yet, so a line stays accurately asserted until it can be taken.
+        self.sync_pci_intx_sources_to_interrupts();
+        let interrupts = self.interrupts.as_ref()?;
+        interrupts.borrow().sync_cr8_tpr_for_cpu(cpu_index, cr8);
+        let pending = interrupts.borrow().get_pending_for_cpu(cpu_index);
+        pending
+    }
+
+    /// Take the next external interrupt vector for a CPU whose architectural state this
+    /// `Machine` does not own.
+    ///
+    /// [`Self::poll_platform_interrupt`] reads `self.cpu` to decide whether delivery is
+    /// possible. That is right for the interpreter and the compiled tier, which run
+    /// against this machine's own `CpuState`, and wrong for a backend that runs the guest
+    /// somewhere else: under KVM the vCPU owns RFLAGS and CR8, and the copy here is only
+    /// whatever was last synced out of it. So the caller passes in the one fact the
+    /// decision turns on instead of letting us read a stale one.
+    ///
+    /// `can_deliver` must mean *the guest will accept this vector now* — IF set, no
+    /// interrupt shadow, and the injection about to be attempted will succeed.
+    /// Acknowledging when it will not would clear the controller and lose the interrupt,
+    /// because the PIC and the LAPIC both latch until the acknowledge handshake.
+    ///
+    /// Returns the acknowledged vector. Delivering it is then the caller's job — from the
+    /// controller's point of view it has already been consumed.
+    pub fn take_external_interrupt_vector(
+        &mut self,
+        cpu_index: usize,
+        can_deliver: bool,
+        cr8: u64,
+    ) -> Option<u8> {
+        let vector = self.peek_external_interrupt_vector(cpu_index, cr8)?;
+        if !can_deliver {
+            return None;
+        }
+        let interrupts = self.interrupts.as_ref()?;
+        interrupts.borrow_mut().acknowledge_for_cpu(cpu_index, vector);
+        Some(vector)
     }
 
     fn poll_platform_interrupt(&mut self, max_queued: usize) -> bool {
@@ -16992,8 +17349,10 @@ impl snapshot::SnapshotTarget for Machine {
         // Snapshots restore RAM and paging control registers, but do not capture the MMU's internal
         // translation cache (TLB). Since `Machine` keeps a persistent MMU to warm the TLB across
         // batches, reset it here so restored execution never uses stale translations.
-        self.mmu = aero_mmu::Mmu::new();
-        self.cpu.state.sync_mmu(&mut self.mmu);
+        self.mmu = Some(Box::new(aero_mmu::Mmu::new()));
+        let mut mmu = Self::take_mmu(&mut self.mmu);
+        self.cpu.state.sync_mmu(&mut mmu);
+        self.mmu = Some(mmu);
         self.mem.clear_dirty();
         self.cpu.state.a20_enabled = self.chipset.a20().enabled();
         self.resync_guest_time_from_tsc();
@@ -18462,8 +18821,11 @@ mod tests {
             "slice accounting must count guest x86 instructions, not lowered IR operations"
         );
         assert_eq!(m.cpu().read_gpr32(gpr::RAX), 550);
-        assert_eq!(m.mmu.cr3(), pd_base);
-        assert_eq!(m.mmu.cr0(), CR0_PE | CR0_PG);
+        // The batch loop lends the MMU out and hands it back; a `None` here would mean
+        // an exit path dropped it, which is exactly what this assertion should catch.
+        let mmu = m.mmu.as_ref().expect("the batch must hand the MMU back");
+        assert_eq!(mmu.cr3(), pd_base);
+        assert_eq!(mmu.cr0(), CR0_PE | CR0_PG);
         assert!(jit.executed_blocks() > 1);
         assert!(jit.executed_guest_instructions() > 4);
     }

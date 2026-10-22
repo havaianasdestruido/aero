@@ -40,6 +40,27 @@ pub trait MemoryBus {
         }
     }
 
+    /// Whether `paddr` is ordinary RAM rather than ROM or MMIO.
+    ///
+    /// See `memory::MemoryBus::is_ram`; `false` is the conservative default.
+    #[inline]
+    fn is_ram(&mut self, _paddr: u64) -> bool {
+        false
+    }
+
+    /// Read the 15-byte instruction window at `paddr`.
+    ///
+    /// Distinct from [`MemoryBus::read_bytes`] because the length is a compile-time
+    /// constant here, so a backend over contiguous RAM can copy it inline. The
+    /// slice form cannot: the callee only sees a runtime length, so it becomes a
+    /// `memcpy` call — once per decoded instruction.
+    #[inline]
+    fn read_insn_window(&mut self, paddr: u64) -> [u8; 15] {
+        let mut buf = [0u8; 15];
+        self.read_bytes(paddr, &mut buf);
+        buf
+    }
+
     /// Write a byte slice to physical memory.
     ///
     /// The default implementation falls back to byte-at-a-time writes via
@@ -607,6 +628,14 @@ pub struct Mmu {
     pcid_enabled: bool,
     pcid: u16,
     tlb: Tlb,
+    /// Bumped whenever anything happens that can invalidate a cached translation.
+    ///
+    /// Consumers that keep their *own* translation cache — the JIT's inline TLB
+    /// lives in WASM linear memory and cannot be reached from here — poll this to
+    /// know when to drop it. Conservative on purpose: a bump that did not strictly
+    /// need to happen costs a re-translation, a missed one leaves compiled code
+    /// using a stale physical page.
+    tlb_generation: u64,
     #[cfg(feature = "stats")]
     stats: MmuStats,
 }
@@ -631,6 +660,7 @@ impl Mmu {
             pcid_enabled: false,
             pcid: 0,
             tlb: Tlb::new(),
+            tlb_generation: 0,
             #[cfg(feature = "stats")]
             stats: MmuStats::default(),
         };
@@ -736,6 +766,7 @@ impl Mmu {
     }
 
     pub fn set_cr0(&mut self, value: u64) {
+        self.tlb_generation = self.tlb_generation.wrapping_add(1);
         let old_pg = self.cr0 & CR0_PG != 0;
         self.cr0 = value;
         let new_pg = self.cr0 & CR0_PG != 0;
@@ -750,6 +781,7 @@ impl Mmu {
     }
 
     pub fn set_cr3(&mut self, value: u64) {
+        self.tlb_generation = self.tlb_generation.wrapping_add(1);
         self.cr3 = value;
         self.update_cached_state();
         let pge = self.cr4_pge();
@@ -774,6 +806,7 @@ impl Mmu {
     }
 
     pub fn set_cr4(&mut self, value: u64) {
+        self.tlb_generation = self.tlb_generation.wrapping_add(1);
         let old_relevant = self.cr4 & (CR4_PAE | CR4_PSE | CR4_PGE | CR4_PCIDE);
         self.cr4 = value;
         let new_relevant = self.cr4 & (CR4_PAE | CR4_PSE | CR4_PGE | CR4_PCIDE);
@@ -789,6 +822,7 @@ impl Mmu {
     }
 
     pub fn set_efer(&mut self, value: u64) {
+        self.tlb_generation = self.tlb_generation.wrapping_add(1);
         let old_relevant = self.efer & (EFER_LME | EFER_NXE);
         self.efer = value;
         let new_relevant = self.efer & (EFER_LME | EFER_NXE);
@@ -803,7 +837,13 @@ impl Mmu {
     }
 
     /// INVLPG.
+    /// Counter that changes whenever a cached translation may have been invalidated.
+    pub fn tlb_generation(&self) -> u64 {
+        self.tlb_generation
+    }
+
     pub fn invlpg(&mut self, vaddr: u64) {
+        self.tlb_generation = self.tlb_generation.wrapping_add(1);
         #[cfg(feature = "stats")]
         {
             self.stats.tlb_invlpg = self.stats.tlb_invlpg.wrapping_add(1);

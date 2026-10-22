@@ -932,6 +932,8 @@ impl JitAbiBuffer {
         let ctx = JitContext {
             ram_base: guest_base,
             tlb_salt,
+                    retired: 0,
+            ..Default::default()
         };
         ctx.write_header_to_mem(self.slice_mut(), base);
     }
@@ -1403,6 +1405,7 @@ impl WasmTieredVm {
             let limits = BlockLimits {
                 max_insts: 64,
                 max_bytes,
+                            ..BlockLimits::default()
             };
             let bitness = self.vcpu.cpu.state.bitness();
             let block = discover_block_mode(&self.vcpu.bus, entry_rip, limits, bitness);
@@ -1472,6 +1475,7 @@ impl WasmTieredVm {
             let limits = BlockLimits {
                 max_insts: 64,
                 max_bytes,
+                            ..BlockLimits::default()
             };
             let bitness = self.vcpu.cpu.state.bitness();
             let block = discover_block_mode(&self.vcpu.bus, entry_rip, limits, bitness);

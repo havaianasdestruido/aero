@@ -71,6 +71,30 @@ pub trait CpuBus {
     #[inline]
     fn invlpg(&mut self, _vaddr: u64) {}
 
+    /// Translate a guest virtual address for compiled code's inline TLB.
+    ///
+    /// Returns the guest *physical* page base and whether that page is ordinary
+    /// RAM. `None` means the access faults, or that this bus cannot answer — in
+    /// either case the compiled block must not cache a mapping and should leave the
+    /// access to the interpreter, which raises the architectural fault itself.
+    ///
+    /// Defaulting to `None` keeps every existing bus correct: without a translation
+    /// the JIT falls back to its identity mapping, which is only used by embedders
+    /// that do not page.
+    fn jit_translate(&mut self, _vaddr: u64, _write: bool) -> Option<(u64, bool)> {
+        None
+    }
+
+    /// Counter that changes whenever a cached translation may have been invalidated.
+    ///
+    /// A consumer keeping its own translation cache — compiled code's inline TLB
+    /// lives in WASM linear memory, out of reach from here — polls this instead of
+    /// dropping everything on principle. Buses that cannot answer return 0, which
+    /// never changes and so means "assume nothing is cacheable".
+    fn jit_tlb_generation(&mut self) -> u64 {
+        0
+    }
+
     /// Observe a successful architectural write to CR3.
     ///
     /// This is an event, not just a state update: writing the same value still
@@ -331,7 +355,36 @@ impl FlatTestBus {
     }
 }
 
+impl FlatTestBus {
+    /// Base address of the backing store.
+    ///
+    /// Compiled code reaches guest RAM as an offset into a linear memory, so an
+    /// embedder driving the JIT over this bus needs to say where that RAM starts.
+    pub fn base_ptr(&self) -> *const u8 {
+        self.mem.as_ptr()
+    }
+
+    /// How many bytes it holds.
+    pub fn len(&self) -> usize {
+        self.mem.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.mem.is_empty()
+    }
+}
+
 impl CpuBus for FlatTestBus {
+    /// Identity, and always RAM.
+    ///
+    /// This bus does not page, so a virtual address is its own physical address —
+    /// which is exactly what the JIT's inline TLB wants to cache. Without this the
+    /// default `None` makes every compiled memory access miss and bail, so a test
+    /// driving compiled code over this bus would silently measure the interpreter.
+    fn jit_translate(&mut self, vaddr: u64, _write: bool) -> Option<(u64, bool)> {
+        Some((vaddr & !0xfff, true))
+    }
+
     fn read_u8(&mut self, vaddr: u64) -> Result<u8, Exception> {
         let idx = usize::try_from(vaddr).map_err(|_| Exception::MemoryFault)?;
         self.mem.get(idx).copied().ok_or(Exception::MemoryFault)

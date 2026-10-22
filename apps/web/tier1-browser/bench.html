@@ -1,0 +1,89 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Aero Tier-1 browser throughput</title>
+<pre id="out">running…</pre>
+<script type="module">
+// How fast does the compiled tier actually run in a browser?
+//
+// The smoke page proves the tier *works* here; this one asks what it costs. Everything
+// above the engine — discovery, translation, dead-flag elimination, codegen — is the
+// same code the native build runs, but the engine underneath is the browser's own
+// optimising JIT rather than Wasmtime, so the native host-instruction figure is a
+// proxy for this at best. Nothing had ever measured it.
+import init, { tier1_bench_block } from './aero_jit_wasm.js';
+
+function hex(s) {
+  const out = new Uint8Array(s.length / 2);
+  for (let i = 0; i < out.length; i++) out[i] = parseInt(s.substr(i * 2, 2), 16);
+  return out;
+}
+
+// Eight blocks in a cycle, two guest instructions each, every one ending in a real
+// branch: `xor rcx,rbx ; jmp +0` seven times, then `dec rax ; jnz loop`.
+//
+// This is the regime that matters, and the 200-instruction version could not reach it.
+// There, blocks end at the decoder's 64-instruction limit, and a block that ends *there*
+// carries an `ExitToInterpreter` terminator which breaks the chain — only 79,872 of
+// 327,680 steps chained, 24%. Real guest blocks end at branches, which chain. A `jmp`
+// ends a block (discovery does not follow unconditional jumps by default) without the
+// superblock formation that silently merges a conditional's fallthrough, so this gets
+// small blocks that are still chainable.
+//
+// Two instructions a block is below the guest's 6.4 average, so this brackets it from
+// the other side: the 200-instruction loop is ~50 a block, this is 2, the truth is
+// between them.
+const LOOP = '4831d9488b5424f04831de48895424e84831df4c8b4424f04931d9eb004831d9488b5424f04831de48895424e84831df4c8b4424f04931d9eb004831d9488b5424f04831de48895424e84831df4c8b4424f04931d9eb004831d9488b5424f04831de48895424e84831df4c8b4424f04931d9eb004831d9488b5424f04831de48895424e84831df4c8b4424f04931d9eb004831d9488b5424f04831de48895424e84831df4c8b4424f04931d9eb004831d9488b5424f04831de48895424e84831df4c8b4424f04931d9eb0048ffc80f852cffffffc3';
+const COUNT = 1_000_000_000;
+const ITERS = 2000;
+
+(async () => {
+  try {
+    await init();
+    const code = hex(LOOP);
+    // One binary, one program, one variable. Natively `AERO_CT_NO_WASM_CHAIN` would do
+    // this, but a wasm32 build has no environment to read, and comparing two *builds* is
+    // how an A/B ends up measuring something other than the knob.
+    const measure = (chain) => {
+      const runs = [];
+      for (let i = 0; i < 7; i++) {
+        const t0 = performance.now();
+        const r = tier1_bench_block(code, 0x1000, COUNT, ITERS, chain);
+        const ms = performance.now() - t0;
+        runs.push({ ms, retired: r.retired, blocks: r.compiledBlocks, steps: r.wasmChainSteps });
+      }
+      const rate = (r) => r.retired / r.ms / 1000;
+      const best = runs.reduce((a, b) => (rate(b) > rate(a) ? b : a));
+      const median = [...runs].sort((a, b) => rate(a) - rate(b))[3];
+      return {
+        retired: best.retired,
+        compiledBlocks: best.blocks,
+        // Zero means the dispatcher never chained, which looks exactly like "chaining
+        // did not help" in a timing result. Counted, not inferred.
+        chainSteps: best.steps,
+        best: +rate(best).toFixed(1),
+        median: +rate(median).toFixed(1),
+        first: +rate(runs[0]).toFixed(1),
+      };
+    };
+    const off = measure(false);
+    const on = measure(true);
+    window.__aeroResult = {
+      ok: true,
+      retired: on.retired,
+      compiledBlocks: on.compiledBlocks,
+      bestMips: on.best,
+      medianMips: on.median,
+      firstMips: on.first,
+      chainedMips: on.median,
+      unchainedMips: off.median,
+      speedup: +(on.median / off.median).toFixed(2),
+      unchainedRetired: off.retired,
+      chainSteps: on.chainSteps,
+      unchainedChainSteps: off.chainSteps,
+    };
+  } catch (e) {
+    window.__aeroResult = { ok: false, error: String((e && e.stack) || e) };
+  }
+  document.getElementById('out').textContent = JSON.stringify(window.__aeroResult, null, 2);
+})();
+</script>

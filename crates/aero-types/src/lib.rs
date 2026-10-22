@@ -223,6 +223,11 @@ impl FlagSet {
     }
 
     #[must_use]
+    /// Flags in both sets.
+    pub const fn intersect(self, other: FlagSet) -> FlagSet {
+        FlagSet(self.0 & other.0)
+    }
+
     pub const fn without(self, other: FlagSet) -> FlagSet {
         FlagSet(self.0 & !other.0)
     }

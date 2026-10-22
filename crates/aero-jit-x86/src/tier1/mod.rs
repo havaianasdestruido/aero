@@ -18,6 +18,8 @@
 //! implements both [`crate::Tier1Bus`] and [`pipeline::Tier1WasmRegistry`], making it a convenient
 //! starting point for experiments and tests.
 
+pub mod flag_elim;
+pub use flag_elim::eliminate_dead_flags;
 pub mod block;
 pub mod ir;
 pub mod translate;
@@ -30,5 +32,6 @@ pub mod pipeline {
 pub use block::{discover_block, discover_block_mode, BasicBlock, BlockEndKind, BlockLimits};
 pub use translate::translate_block;
 pub use wasm_codegen::{
-    Tier1WasmCodegen, Tier1WasmOptions, EXPORT_BLOCK_FN, EXPORT_TIER1_BLOCK_FN,
+    Tier1ModuleNeeds, Tier1WasmCodegen, Tier1WasmOptions, EXPORT_BLOCK_FN,
+    EXPORT_TIER1_BLOCK_FN, EXPORT_TIER1_DISPATCH_FN,
 };

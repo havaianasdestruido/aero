@@ -63,7 +63,16 @@ impl IoBus for NoIo {
 /// adapter translates them to physical addresses via `aero-mmu` before accessing
 /// the underlying physical bus `B`.
 pub struct PagingBus<B, IO = NoIo> {
-    mmu: Mmu,
+    /// Boxed, not inline.
+    ///
+    /// The MMU carries a full software TLB, which makes the struct around it several
+    /// kilobytes wide. `Machine` builds one of these on every outer-loop batch boundary
+    /// and swaps its durable MMU in, so an inline TLB turned each boundary into seven
+    /// multi-kilobyte `memmove`s — the construction, the swap's three copies, and the
+    /// moves into the wrapping bus. Measured at 66KB per boundary, 2.5GB across a 120M
+    /// instruction window, ~3.4 host instructions per guest instruction. Behind a box,
+    /// all of that becomes pointer-sized, at the cost of one indirection per MMU access.
+    mmu: Box<Mmu>,
     phys: B,
     io: IO,
     cpl: u8,
@@ -100,6 +109,15 @@ impl<B, IO> PagingBus<B, IO> {
     /// MMU (e.g. `Machine`'s TLB across batches): `new_with_io` allocates and zeroes a full
     /// software TLB that is immediately discarded via swap.
     pub fn with_mmu_and_io(mmu: Mmu, phys: B, io: IO) -> PagingBus<B, IO> {
+        Self::with_boxed_mmu_and_io(Box::new(mmu), phys, io)
+    }
+
+    /// As [`PagingBus::with_mmu_and_io`], but takes the MMU already boxed.
+    ///
+    /// This is the one that costs nothing to call in a loop: handing over an owned `Mmu`
+    /// moves the whole software TLB, and a caller that rebuilds the bus every batch pays
+    /// that move every time.
+    pub fn with_boxed_mmu_and_io(mmu: Box<Mmu>, phys: B, io: IO) -> PagingBus<B, IO> {
         Self {
             mmu,
             phys,
@@ -124,9 +142,25 @@ impl<B, IO> PagingBus<B, IO> {
         &mut self.mmu
     }
 
+    /// The MMU's box itself, so a caller can swap in another without moving either TLB.
+    ///
+    /// Same invalidation obligation as [`PagingBus::mmu_mut`], and more of it: the
+    /// memoised fetch translation belongs to whichever MMU was here before.
+    #[inline]
+    pub fn boxed_mmu_mut(&mut self) -> &mut Box<Mmu> {
+        self.fetch_page = None;
+        &mut self.mmu
+    }
+
     /// Consume the bus and return the MMU (preserving TLB state) plus the physical backend.
     #[inline]
     pub fn into_mmu_and_phys(self) -> (Mmu, B) {
+        (*self.mmu, self.phys)
+    }
+
+    /// As [`PagingBus::into_mmu_and_phys`], without unboxing the MMU.
+    #[inline]
+    pub fn into_boxed_mmu_and_phys(self) -> (Box<Mmu>, B) {
         (self.mmu, self.phys)
     }
 
@@ -438,6 +472,14 @@ impl<B: MemoryBus, IO: IoBus> CpuBus for WriteIntent<'_, B, IO> {
         self.bus.invlpg(vaddr);
     }
 
+    fn jit_translate(&mut self, vaddr: u64, write: bool) -> Option<(u64, bool)> {
+        self.bus.jit_translate(vaddr, write)
+    }
+
+    fn jit_tlb_generation(&mut self) -> u64 {
+        self.bus.jit_tlb_generation()
+    }
+
     fn write_cr3(&mut self, value: u64) {
         self.bus.write_cr3(value);
     }
@@ -524,6 +566,25 @@ where
     fn invlpg(&mut self, vaddr: u64) {
         self.fetch_page = None;
         self.mmu.invlpg(vaddr);
+    }
+
+    fn jit_tlb_generation(&mut self) -> u64 {
+        self.mmu.tlb_generation()
+    }
+
+    fn jit_translate(&mut self, vaddr: u64, write: bool) -> Option<(u64, bool)> {
+        let access = if write {
+            AccessType::Write
+        } else {
+            AccessType::Read
+        };
+        // A fault here is not ours to raise: report no mapping and let the
+        // interpreter re-execute the instruction so it raises the fault with the
+        // right error code and CR2.
+        let paddr = self.translate(vaddr, access).ok()?;
+        let page = paddr & !(PAGE_SIZE - 1);
+        let is_ram = self.phys.is_ram(page);
+        Some((page, is_ram))
     }
 
     fn write_cr3(&mut self, value: u64) {
@@ -782,12 +843,21 @@ where
             let vpage = vaddr - page_off;
             if let Some((memo_vpage, memo_ppage)) = self.fetch_page {
                 if memo_vpage == vpage {
+                    // A full window is the overwhelmingly common case, and asking
+                    // for a constant 15 bytes lets the backend copy them inline
+                    // instead of calling `memcpy` once per instruction.
+                    if len == 15 {
+                        return Ok(self.phys.read_insn_window(memo_ppage + page_off));
+                    }
                     self.phys.read_bytes(memo_ppage + page_off, &mut buf[..len]);
                     return Ok(buf);
                 }
             }
             let paddr = self.translate(vaddr, AccessType::Execute)?;
             self.fetch_page = Some((vpage, paddr - page_off));
+            if len == 15 {
+                return Ok(self.phys.read_insn_window(paddr));
+            }
             self.phys.read_bytes(paddr, &mut buf[..len]);
             return Ok(buf);
         }
@@ -993,6 +1063,9 @@ mod fetch_memo_tests {
 
         let near_end = CODE_VA + 0xffc;
         let window = bus.fetch(near_end, 15).expect("crossing fetch");
-        assert_eq!(window[4], 0xBB, "bytes past the page boundary come from the next frame");
+        assert_eq!(
+            window[4], 0xBB,
+            "bytes past the page boundary come from the next frame"
+        );
     }
 }

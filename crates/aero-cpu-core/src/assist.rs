@@ -110,7 +110,7 @@ pub fn handle_assist<B: CpuBus>(
     let cs_base = state.seg_base_reg(Register::CS);
     let (bytes, decoded) =
         crate::interp::tier0::exec::fetch_and_decode(state, bus, cs_base, ip, aero_x86::decode)
-        .inspect_err(|e| state.apply_exception_side_effects(e))?;
+            .inspect_err(|e| state.apply_exception_side_effects(e))?;
     let addr_size_override = has_addr_size_override(&bytes, state.bitness());
 
     exec_decoded(ctx, time, state, bus, &decoded, addr_size_override)
@@ -120,6 +120,105 @@ pub fn handle_assist<B: CpuBus>(
     // caller doesn't go through `tier0::exec::step` immediately.
     bus.sync(state);
     Ok(())
+}
+
+/// How many decodes the assist path remembers. A compiled block hands the same
+/// instruction over every time it runs — 1.56M assists came from 898 blocks in one
+/// session, so roughly 1,700 visits each — and decoding is a large part of what an
+/// assist costs.
+const ASSIST_DECODE_ENTRIES: usize = 1024;
+
+#[derive(Clone)]
+struct AssistDecodeEntry {
+    rip: u64,
+    /// The bytes the entry was decoded from, so a page that has been rewritten under
+    /// the same address is not decoded from memory that has since changed.
+    key: u64,
+    decoded: aero_x86::DecodedInst,
+}
+
+thread_local! {
+    static ASSIST_DECODE: core::cell::RefCell<Vec<Option<AssistDecodeEntry>>> =
+        core::cell::RefCell::new(vec![None; ASSIST_DECODE_ENTRIES]);
+}
+
+/// Pack the first eight bytes of the fetch window, as the Tier-0 decode cache does.
+fn assist_decode_key(bytes: &[u8]) -> u64 {
+    let mut k = 0u64;
+    for (i, b) in bytes.iter().take(8).enumerate() {
+        k |= u64::from(*b) << (i * 8);
+    }
+    k
+}
+
+fn assist_decode(
+    bytes: &[u8],
+    ip: u64,
+    bitness: u32,
+) -> Result<aero_x86::DecodedInst, aero_x86::DecodeError> {
+    let key = assist_decode_key(bytes);
+    let slot = (ip as usize >> 2) & (ASSIST_DECODE_ENTRIES - 1);
+    let hit = ASSIST_DECODE.with(|c| {
+        c.borrow()[slot]
+            .as_ref()
+            .filter(|e| e.rip == ip && e.key == key)
+            .map(|e| e.decoded.clone())
+    });
+    if let Some(d) = hit {
+        return Ok(d);
+    }
+    let decoded = aero_x86::decode(bytes, ip, bitness)?;
+    ASSIST_DECODE.with(|c| {
+        c.borrow_mut()[slot] = Some(AssistDecodeEntry {
+            rip: ip,
+            key,
+            decoded: decoded.clone(),
+        });
+    });
+    Ok(decoded)
+}
+
+/// Execute exactly one guest instruction, whatever kind it is.
+///
+/// The compiled tier calls this for an instruction Tier-1 cannot translate, from the
+/// middle of a compiled block: the block has written the architectural state out, this
+/// advances it by one instruction, and the block picks it up and carries on. Which is
+/// why it has to handle *any* instruction and not only the assist mnemonics — Tier-1
+/// refuses plenty that Tier-0 executes directly, `bsf` and `movnti` among them.
+///
+/// Returns the RIP the guest ended up at. `None` means the instruction did not
+/// complete — an exception, a halt, a BIOS interrupt — and the caller must leave the
+/// architectural state alone and let the interpreter own it. Interrupt-related
+/// assists are refused for the same reason: delivering one is Tier-0's business, at
+/// the point in its loop where it does that.
+pub fn assist_one_instruction<B: CpuBus>(
+    ctx: &mut AssistContext,
+    time: &mut TimeSource,
+    state: &mut CpuState,
+    bus: &mut B,
+) -> Option<u64> {
+    use crate::exception::AssistReason;
+    use crate::interp::tier0::exec::{step_with_config_and_decoder, StepExit};
+    use crate::interp::tier0::Tier0Config;
+
+    let cfg = Tier0Config::from_cpuid(&ctx.features);
+    match step_with_config_and_decoder(&cfg, state, bus, assist_decode) {
+        Ok(StepExit::Continue | StepExit::ContinueInhibitInterrupts | StepExit::Branch) => {
+            Some(state.rip())
+        }
+        Ok(StepExit::Assist {
+            reason,
+            decoded,
+            addr_size_override,
+        }) => {
+            if reason == AssistReason::Interrupt {
+                return None;
+            }
+            handle_assist_decoded(ctx, time, state, bus, &decoded, addr_size_override).ok()?;
+            Some(state.rip())
+        }
+        Ok(StepExit::Halted | StepExit::BiosInterrupt(_)) | Err(_) => None,
+    }
 }
 
 /// Execute an assist using a pre-decoded instruction.
@@ -1641,7 +1740,11 @@ mod syscall_log_filter_tests {
     #[test]
     fn parses_hex_ntcreateuserprocess_and_alpc() {
         let got = parse_syscall_log_filter_spec(Some("aa,0x82"));
-        assert_eq!(got, vec![0xaa, 0x82], "Win7 NtCreateUserProcess=0xAA, NtAlpcSendWaitReceivePort=0x82");
+        assert_eq!(
+            got,
+            vec![0xaa, 0x82],
+            "Win7 NtCreateUserProcess=0xAA, NtAlpcSendWaitReceivePort=0x82"
+        );
     }
 
     #[test]
@@ -1652,7 +1755,6 @@ mod syscall_log_filter_tests {
 }
 
 static SYSCALL_LOG_FILTER: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
-
 
 fn is_canonical(addr: u64, bits: u8) -> bool {
     if bits >= 64 {

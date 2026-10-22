@@ -27,7 +27,11 @@ fn lahf_sahf_preserve_cf_across_add_sp() {
 
     assert_eq!(run_batch(&mut state, &mut bus, 1).executed, 1); // lahf
     assert_eq!(state.read_reg(Register::AH) & 0x01, 1);
-    assert_eq!(state.read_reg(Register::AH) & 0x02, 2, "bit 1 is reserved 1");
+    assert_eq!(
+        state.read_reg(Register::AH) & 0x02,
+        2,
+        "bit 1 is reserved 1"
+    );
     assert_eq!(state.read_reg(Register::AH) & 0x40, 0x40);
 
     assert_eq!(run_batch(&mut state, &mut bus, 1).executed, 1); // add sp,10h
@@ -35,6 +39,10 @@ fn lahf_sahf_preserve_cf_across_add_sp() {
     assert_eq!(state.rflags() & FLAG_CF, 0, "ADD clears CF");
 
     assert_eq!(run_batch(&mut state, &mut bus, 1).executed, 1); // sahf
-    assert_ne!(state.rflags() & FLAG_CF, 0, "SAHF must restore INT13-style CF");
+    assert_ne!(
+        state.rflags() & FLAG_CF,
+        0,
+        "SAHF must restore INT13-style CF"
+    );
     assert_ne!(state.rflags() & FLAG_ZF, 0);
 }

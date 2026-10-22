@@ -1,6 +1,14 @@
-use super::{Address, AluOp, DecodeError, DecodedInst, InstKind, Operand, Reg, ShiftOp};
+use super::BitOp;
+use super::{
+    Address, AluOp, DecodeError, DecodedInst, InstKind, Operand, Reg, SegmentPrefix, ShiftOp,
+};
 use aero_types::{Cond, Gpr, Width};
 
+/// Prefix state that affects how the rest of an instruction decodes.
+///
+/// This is threaded to every operand decoder already, which is why the segment
+/// override lives here rather than as a twenty-third argument: `Operand::Mem` is
+/// built in one place, and that place needs to know.
 #[derive(Debug, Clone, Copy)]
 struct Rex {
     present: bool,
@@ -8,6 +16,8 @@ struct Rex {
     r: bool,
     x: bool,
     b: bool,
+    /// `fs:`/`gs:` override, when one was present.
+    seg: Option<SegmentPrefix>,
 }
 
 impl Rex {
@@ -18,6 +28,7 @@ impl Rex {
             r: false,
             x: false,
             b: false,
+            seg: None,
         }
     }
 
@@ -29,6 +40,7 @@ impl Rex {
             r: (b & 0x04) != 0,
             x: (b & 0x02) != 0,
             b: (b & 0x01) != 0,
+            seg: None,
         }
     }
 }
@@ -344,7 +356,11 @@ fn decode_modrm_operand(
             *offset += 1;
             let (scale_bits, index_code, base_code) = parse_sib(sib_byte, rex);
             scale = 1u8 << scale_bits;
-            if (index_code & 0x7) != 4 {
+            // Index 100b means "no index" only without REX.X. With it the field
+            // names r12, a perfectly ordinary index register, so masking the REX bit
+            // off before the comparison silently drops the index and turns
+            // `[r13+r12*2]` into `[r13]`.
+            if index_code != 4 {
                 index = Some(decode_gpr(index_code)?);
             }
             if (base_code & 0x7) == 5 && modrm.mod_bits == 0 {
@@ -396,6 +412,7 @@ fn decode_modrm_operand(
             scale,
             disp,
             rip_relative,
+            segment: rex.seg,
         }),
         modrm,
     ))
@@ -435,12 +452,25 @@ pub fn decode_one(rip: u64, bytes: &[u8]) -> DecodedInst {
 pub fn decode_one_mode(rip: u64, bytes: &[u8], bitness: u32) -> DecodedInst {
     match decode_one_inner(rip, bytes, bitness) {
         Ok(inst) => inst,
-        Err(_) => DecodedInst {
-            rip,
-            len: 1,
-            kind: InstKind::Invalid,
-            next_rip: rip.wrapping_add(1) & ip_mask(bitness),
-        },
+        // Tier-1's decoder covers the instructions Tier-1 can translate. For anything
+        // else the *length* still matters — it is where the instruction after it
+        // begins, and a caller that means to step over this one needs that. Guessing
+        // one byte is wrong for most of them: `out`, `cli`, `mov cr8` and the locked
+        // compare-exchanges are all longer. The full decoder knows, so ask it.
+        Err(_) => {
+            let full = crate::decode(bytes, rip, bitness).ok();
+            let len = full.as_ref().map_or(1, |d| d.len.max(1));
+            let assistable = full
+                .as_ref()
+                .is_some_and(|d| !is_interrupt_related(d.instr.mnemonic()));
+            DecodedInst {
+                rip,
+                len,
+                kind: InstKind::Invalid,
+                assistable,
+                next_rip: rip.wrapping_add(u64::from(len)) & ip_mask(bitness),
+            }
+        }
     }
 }
 
@@ -453,11 +483,19 @@ fn decode_one_inner(rip: u64, bytes: &[u8], bitness: u32) -> Result<DecodedInst,
 
     let mut offset = 0usize;
     let mut rex = Rex::none();
+    let mut seg: Option<SegmentPrefix> = None;
     let mut operand_override = false;
     let mut address_override = false;
+    let mut lock_prefix = false;
 
     loop {
         let b = read_u8(bytes, offset)?;
+        // A REX prefix only has effect when it is the *last* prefix before the opcode.
+        // `48 F2 B8 ...` is `MOV EAX, imm32` with an ignored REX, not `MOV RAX, imm64`:
+        // the `F2` after the `48` discards it. Getting this wrong made the instruction
+        // four bytes longer than it is, so the next one decoded from the middle of this
+        // one — found by the proptest against iced, not by anything running.
+        let is_rex = bitness == 64 && (0x40..=0x4f).contains(&b);
         match b {
             0x66 => {
                 operand_override = true;
@@ -471,8 +509,35 @@ fn decode_one_inner(rip: u64, bytes: &[u8], bitness: u32) -> Result<DecodedInst,
                 address_override = true;
                 offset += 1;
             }
+            0xf0 => {
+                // LOCK. Aero runs its CPUs one at a time under a cooperative
+                // BSP-driven scheduler in a single thread, so no two of them execute
+                // concurrently and a read-modify-write is already indivisible with
+                // respect to the others. The prefix is therefore recorded and the
+                // instruction translated as the plain RMW it wraps — but only for
+                // the forms LOCK is legal on, checked below, so that a prefix on
+                // anything else goes to the interpreter rather than being dropped.
+                lock_prefix = true;
+                offset += 1;
+            }
             0xf2 | 0xf3 => {
                 // Ignored for this subset.
+                offset += 1;
+            }
+            // Segment overrides. Only FS and GS have a base worth honouring in long
+            // mode; the others are zero-based there, so ignoring them is correct.
+            // Windows reaches its per-CPU block through `gs:`, and before this every
+            // block containing one bailed — the largest single cause of them.
+            0x64 => {
+                seg = Some(SegmentPrefix::Fs);
+                offset += 1;
+            }
+            0x65 => {
+                seg = Some(SegmentPrefix::Gs);
+                offset += 1;
+            }
+            0x2e | 0x36 | 0x3e | 0x26 if bitness == 64 => {
+                // CS/SS/DS/ES are zero-based in long mode: no effect on the address.
                 offset += 1;
             }
             0x40..=0x4f if bitness == 64 => {
@@ -481,7 +546,17 @@ fn decode_one_inner(rip: u64, bytes: &[u8], bitness: u32) -> Result<DecodedInst,
             }
             _ => break,
         }
+        if !is_rex {
+            // A prefix followed this REX, so the REX is not the last one and does not
+            // apply. Only reached when a prefix byte was consumed; `_ => break` leaves
+            // the loop before it.
+            rex = Rex::none();
+        }
     }
+
+    // The segment override is carried on the REX record for convenience, and unlike the
+    // REX bits it survives whatever order the prefixes came in.
+    rex.seg = seg;
 
     let opcode1 = read_u8(bytes, offset)?;
     offset += 1;
@@ -492,6 +567,7 @@ fn decode_one_inner(rip: u64, bytes: &[u8], bitness: u32) -> Result<DecodedInst,
             len: offset as u8,
             kind: InstKind::Invalid,
             next_rip,
+                    assistable: true,
         });
     }
 
@@ -708,6 +784,52 @@ fn decode_one_inner(rip: u64, bytes: &[u8], bitness: u32) -> Result<DecodedInst,
         }
         // Group2 shifts (0xC0/0xC1/0xD0/0xD1) are decoded below as `InstKind::Shift` so Tier1
         // can keep the shift count as a `u8` instead of embedding it into an `Operand::Imm`.
+        // Accumulator-with-byte-immediate forms: `op AL, imm8`. The word-width
+        // siblings (0x05, 0x0D, ... 0x3D, 0xA9) are handled below; these read a
+        // one-byte immediate instead, which is why they cannot share that arm.
+        0x04 | 0x0c | 0x14 | 0x1c | 0x24 | 0x2c | 0x34 | 0x3c | 0xa8 => {
+            let (op, is_cmp, is_test) = match opcode1 {
+                0x04 => (AluOp::Add, false, false),
+                0x0c => (AluOp::Or, false, false),
+                0x14 => (AluOp::Adc, false, false),
+                0x1c => (AluOp::Sbb, false, false),
+                0x24 => (AluOp::And, false, false),
+                0x2c => (AluOp::Sub, false, false),
+                0x34 => (AluOp::Xor, false, false),
+                0x3c => (AluOp::Sub, true, false),
+                0xa8 => (AluOp::And, false, true),
+                _ => unreachable!(),
+            };
+            let imm = read_le(bytes, offset, 1)?;
+            offset += 1;
+            // Always AL: these opcodes have no ModRM, so REX.B cannot redirect them
+            // to SPL/BPL/SIL/DIL the way a byte register operand otherwise would.
+            let al = Operand::Reg(Reg {
+                gpr: Gpr::Rax,
+                width: Width::W8,
+                high8: false,
+            });
+            if is_cmp {
+                InstKind::Cmp {
+                    lhs: al,
+                    rhs: Operand::Imm(imm),
+                    width: Width::W8,
+                }
+            } else if is_test {
+                InstKind::Test {
+                    lhs: al,
+                    rhs: Operand::Imm(imm),
+                    width: Width::W8,
+                }
+            } else {
+                InstKind::Alu {
+                    op,
+                    dst: al,
+                    src: Operand::Imm(imm),
+                    width: Width::W8,
+                }
+            }
+        }
         0x05 | 0x25 | 0x0d | 0x35 | 0x2d | 0x3d | 0xa9 => {
             let (op, is_cmp, is_test, acc) = match opcode1 {
                 0x05 => (AluOp::Add, false, false, Gpr::Rax),
@@ -943,6 +1065,18 @@ fn decode_one_inner(rip: u64, bytes: &[u8], bitness: u32) -> Result<DecodedInst,
             let (dst, modrm) =
                 decode_modrm_operand(bytes, &mut offset, bitness, rex, rex.present, Width::W8)?;
             match modrm.reg & 0x7 {
+                // `/0` and `/1` are both TEST r/m8, imm8. Common enough in real code
+                // that leaving it out walls off whole blocks: a block Tier-1 cannot
+                // finish stops every chain that reaches it.
+                0 | 1 => {
+                    let imm = read_le(bytes, offset, 1)?;
+                    offset += 1;
+                    InstKind::Test {
+                        lhs: dst,
+                        rhs: Operand::Imm(imm),
+                        width: Width::W8,
+                    }
+                }
                 2 => InstKind::Not {
                     dst,
                     width: Width::W8,
@@ -962,6 +1096,28 @@ fn decode_one_inner(rip: u64, bytes: &[u8], bitness: u32) -> Result<DecodedInst,
             let (dst, modrm) =
                 decode_modrm_operand(bytes, &mut offset, bitness, rex, rex.present, width)?;
             match modrm.reg & 0x7 {
+                // TEST r/m, imm. The immediate follows the operand-size attribute,
+                // except in 64-bit mode where it is imm32 sign-extended.
+                0 | 1 => {
+                    let imm = if width == Width::W16 {
+                        let imm16 = read_le(bytes, offset, 2)? as u16;
+                        offset += 2;
+                        imm16 as u64
+                    } else {
+                        let imm32 = read_le(bytes, offset, 4)? as u32;
+                        offset += 4;
+                        if width == Width::W64 {
+                            sign_extend_imm(Width::W32, imm32 as u64)
+                        } else {
+                            imm32 as u64
+                        }
+                    };
+                    InstKind::Test {
+                        lhs: dst,
+                        rhs: Operand::Imm(imm),
+                        width,
+                    }
+                }
                 2 => InstKind::Not { dst, width },
                 3 => InstKind::Neg { dst, width },
                 _ => {
@@ -976,7 +1132,12 @@ fn decode_one_inner(rip: u64, bytes: &[u8], bitness: u32) -> Result<DecodedInst,
             // while PUSH (group 6) uses the mode's stack width.
             let modrm_byte = read_u8(bytes, offset)?;
             let group = (modrm_byte >> 3) & 0x7;
-            let operand_width = if group == 6 { stack_width } else { width };
+            // Near call/jump default to the stack width in long mode, as PUSH does.
+            let operand_width = if matches!(group, 2 | 4 | 6) {
+                stack_width
+            } else {
+                width
+            };
             let (opnd, _modrm) =
                 decode_modrm_operand(bytes, &mut offset, bitness, rex, rex.present, operand_width)?;
             match group {
@@ -988,6 +1149,20 @@ fn decode_one_inner(rip: u64, bytes: &[u8], bitness: u32) -> Result<DecodedInst,
                         InstKind::Invalid
                     } else {
                         InstKind::Push { src: opnd }
+                    }
+                }
+                // Near indirect call/jump. `call qword [rip+disp32]` alone is the
+                // second-largest wall in a Windows desktop session: it is how every
+                // import-table call dispatches.
+                2 | 4 => {
+                    if operand_override {
+                        // The branch operand size would no longer match the stack
+                        // width the push assumes; see `0x50..=0x57` below.
+                        InstKind::Invalid
+                    } else if group == 2 {
+                        InstKind::CallIndirect { target: opnd }
+                    } else {
+                        InstKind::JmpIndirect { target: opnd }
                     }
                 }
                 _ => {
@@ -1161,7 +1336,55 @@ fn decode_one_inner(rip: u64, bytes: &[u8], bitness: u32) -> Result<DecodedInst,
                 // bail out to the interpreter to avoid miscompilation.
                 InstKind::Invalid
             } else {
-                InstKind::Ret
+                InstKind::Ret { pop: 0 }
+            }
+        }
+        0x63 => {
+            // MOVSXD r64, r/m32. Without REX.W it is a plain 32-bit move, which the
+            // interpreter can have rather than a special case here.
+            if width != Width::W64 {
+                InstKind::Invalid
+            } else {
+                let (src, modrm) =
+                    decode_modrm_operand(bytes, &mut offset, bitness, rex, rex.present, Width::W32)?;
+                let dst = Operand::Reg(decode_reg_from_modrm(modrm, rex.present, Width::W64)?);
+                InstKind::MovSx {
+                    dst,
+                    src,
+                    dst_width: Width::W64,
+                    src_width: Width::W32,
+                }
+            }
+        }
+        0xfe => {
+            // INC/DEC r/m8. The wider forms live at 0xFF; this is the byte case.
+            let modrm_byte = read_u8(bytes, offset)?;
+            let group = (modrm_byte >> 3) & 0x7;
+            let (opnd, _modrm) =
+                decode_modrm_operand(bytes, &mut offset, bitness, rex, rex.present, Width::W8)?;
+            match group {
+                0 => InstKind::Inc {
+                    dst: opnd,
+                    width: Width::W8,
+                },
+                1 => InstKind::Dec {
+                    dst: opnd,
+                    width: Width::W8,
+                },
+                _ => InstKind::Invalid,
+            }
+        }
+        0xc2 => {
+            // RET imm16: pop the return address, then release `imm16` more bytes of
+            // arguments. Common in stdcall-convention Windows code, and a block
+            // ending in one is a wall every chain reaching it stops at.
+            if operand_override && bitness != 64 {
+                // See `0xC3` above.
+                InstKind::Invalid
+            } else {
+                let pop = read_le(bytes, offset, 2)? as u16;
+                offset += 2;
+                InstKind::Ret { pop }
             }
         }
         0x70..=0x7f => {
@@ -1250,6 +1473,216 @@ fn decode_one_inner(rip: u64, bytes: &[u8], bitness: u32) -> Result<DecodedInst,
                         width,
                     }
                 }
+                0x31 => InstKind::Rdtsc,
+                // LFENCE/MFENCE/SFENCE. Aero runs one CPU at a time, so ordering
+                // between them is not observable and these are hints.
+                0xae if rmw_ops_enabled() => {
+                    let modrm_byte = read_u8(bytes, offset)?;
+                    let group = (modrm_byte >> 3) & 0x7;
+                    if (modrm_byte >> 6) == 0b11 && matches!(group, 5 | 6 | 7) {
+                        offset += 1;
+                        InstKind::Nop
+                    } else {
+                        InstKind::Invalid
+                    }
+                }
+                // XADD r/m, r
+                0xc0 | 0xc1 if rmw_ops_enabled() => {
+                    let w = if opcode2 == 0xc0 { Width::W8 } else { width };
+                    let (dst, modrm) =
+                        decode_modrm_operand(bytes, &mut offset, bitness, rex, rex.present, w)?;
+                    let src = decode_reg_from_modrm(modrm, rex.present, w)?;
+                    InstKind::Xadd { dst, src, width: w }
+                }
+                // CMPXCHG r/m, r
+                0xb0 | 0xb1 if rmw_ops_enabled() => {
+                    let w = if opcode2 == 0xb0 { Width::W8 } else { width };
+                    let (dst, modrm) =
+                        decode_modrm_operand(bytes, &mut offset, bitness, rex, rex.present, w)?;
+                    let src = decode_reg_from_modrm(modrm, rex.present, w)?;
+                    InstKind::Cmpxchg { dst, src, width: w }
+                }
+                // PREFETCH/PREFETCHW/PREFETCHNTA and friends: architecturally hints,
+                // and between them the single largest entry left on the coverage
+                // wall. The ModRM still has to be consumed to get the length right.
+                0x0d | 0x18 if !hint_ops_disabled() => {
+                    let (_opnd, _modrm) = decode_modrm_operand(
+                        bytes,
+                        &mut offset,
+                        bitness,
+                        rex,
+                        rex.present,
+                        Width::W8,
+                    )?;
+                    InstKind::Nop
+                }
+                // MOVNTI: a store, with a non-temporal hint that is only a hint.
+                0xc3 if !hint_ops_disabled() => {
+                    if width == Width::W8 || width == Width::W16 {
+                        InstKind::Invalid
+                    } else {
+                        let (dst, modrm) = decode_modrm_operand(
+                            bytes,
+                            &mut offset,
+                            bitness,
+                            rex,
+                            rex.present,
+                            width,
+                        )?;
+                        if matches!(dst, Operand::Reg(_)) {
+                            // Register destination is not a valid encoding.
+                            InstKind::Invalid
+                        } else {
+                            let src = Operand::Reg(decode_reg_from_modrm(modrm, rex.present, width)?);
+                            InstKind::Mov { dst, src, width }
+                        }
+                    }
+                }
+                // BT/BTS/BTR/BTC with a register bit offset.
+                0xa3 | 0xab | 0xb3 | 0xbb if !hint_ops_disabled() => {
+                    let op = match opcode2 {
+                        0xa3 => BitOp::Test,
+                        0xab => BitOp::Set,
+                        0xb3 => BitOp::Reset,
+                        _ => BitOp::Complement,
+                    };
+                    let (dst, modrm) =
+                        decode_modrm_operand(bytes, &mut offset, bitness, rex, rex.present, width)?;
+                    let index = decode_reg_from_modrm(modrm, rex.present, width)?;
+                    InstKind::BitTestReg {
+                        op,
+                        dst,
+                        index,
+                        width,
+                    }
+                }
+                0xba => {
+                    // Group 8: BT/BTS/BTR/BTC with an 8-bit immediate offset.
+                    // `lock bts qword [rdi+0x88], imm8` is the busiest entry left on
+                    // the coverage wall.
+                    let modrm_byte = read_u8(bytes, offset)?;
+                    let group = (modrm_byte >> 3) & 0x7;
+                    let op = match group {
+                        4 => Some(BitOp::Test),
+                        5 => Some(BitOp::Set),
+                        6 => Some(BitOp::Reset),
+                        7 => Some(BitOp::Complement),
+                        _ => None,
+                    };
+                    match op {
+                        None => InstKind::Invalid,
+                        Some(op) => {
+                            let (dst, _modrm) = decode_modrm_operand(
+                                bytes,
+                                &mut offset,
+                                bitness,
+                                rex,
+                                rex.present,
+                                width,
+                            )?;
+                            let imm = read_u8(bytes, offset)?;
+                            offset += 1;
+                            // Intel adjusts the address for an offset past the
+                            // operand size, and Tier-0 does it for the immediate
+                            // form too; with a constant offset the whole adjustment
+                            // folds here. `bits` is a power of two, so the euclidean
+                            // divide and remainder are a shift and a mask.
+                            let bits = width.bits();
+                            let bit = (u32::from(imm) % bits) as u8;
+                            let word_off = (u32::from(imm) / bits) as i32;
+                            let dst = match dst {
+                                Operand::Mem(mut addr) if word_off != 0 => {
+                                    let unit_bytes = (bits / 8) as i32;
+                                    addr.disp = addr.disp.wrapping_add(word_off * unit_bytes);
+                                    Operand::Mem(addr)
+                                }
+                                other => other,
+                            };
+                            InstKind::BitTest {
+                                op,
+                                dst,
+                                bit,
+                                width,
+                            }
+                        }
+                    }
+                }
+                0xbc | 0xbd if bitscan_enabled() => {
+                    // BSF (0xBC) / BSR (0xBD): `reg` is the destination, `r/m` the
+                    // source, both at the operand width. ~17,400 wanted executions of
+                    // blocks refused for want of these, the largest translatable
+                    // entry left on the coverage wall.
+                    let (src, modrm) =
+                        decode_modrm_operand(bytes, &mut offset, bitness, rex, rex.present, width)?;
+                    let dst = Operand::Reg(decode_reg_from_modrm(modrm, rex.present, width)?);
+                    InstKind::BitScan {
+                        dst,
+                        src,
+                        width,
+                        forward: opcode2 == 0xbc,
+                    }
+                }
+                0xbe | 0xbf => {
+                    // MOVSX r, r/m8 (0xBE) and r, r/m16 (0xBF). The zero-extending
+                    // pair a few lines down was already taken; these are just as
+                    // common in Windows code that handles `char` and `short`.
+                    let src_width = if opcode2 == 0xbe {
+                        Width::W8
+                    } else {
+                        Width::W16
+                    };
+                    if opcode2 == 0xbf && width == Width::W16 {
+                        // A 16-bit destination would be a plain move.
+                        InstKind::Invalid
+                    } else {
+                        let (src, modrm) = decode_modrm_operand(
+                            bytes,
+                            &mut offset,
+                            bitness,
+                            rex,
+                            rex.present,
+                            src_width,
+                        )?;
+                        let dst = Operand::Reg(decode_reg_from_modrm(modrm, rex.present, width)?);
+                        InstKind::MovSx {
+                            dst,
+                            src,
+                            dst_width: width,
+                            src_width,
+                        }
+                    }
+                }
+                0xb6 | 0xb7 => {
+                    // MOVZX r, r/m8 (0xB6) and r, r/m16 (0xB7). Among the most
+                    // common instructions in compiled Windows code, and a block
+                    // Tier-1 cannot finish stops every chain reaching it.
+                    let src_width = if opcode2 == 0xb6 {
+                        Width::W8
+                    } else {
+                        Width::W16
+                    };
+                    // A 16-bit destination for 0xB7 would be a no-op move; the
+                    // interpreter can have that rather than a special case here.
+                    if opcode2 == 0xb7 && width == Width::W16 {
+                        InstKind::Invalid
+                    } else {
+                        let (src, modrm) = decode_modrm_operand(
+                            bytes,
+                            &mut offset,
+                            bitness,
+                            rex,
+                            rex.present,
+                            src_width,
+                        )?;
+                        let dst = Operand::Reg(decode_reg_from_modrm(modrm, rex.present, width)?);
+                        InstKind::MovZx {
+                            dst,
+                            src,
+                            dst_width: width,
+                            src_width,
+                        }
+                    }
+                }
                 0xaf => {
                     // IMUL r, r/m  (two-operand). Destination is ModRM.reg.
                     let (src, modrm) =
@@ -1292,11 +1725,188 @@ fn decode_one_inner(rip: u64, bytes: &[u8], bitness: u32) -> Result<DecodedInst,
         }
     };
 
+    // A LOCK prefix is only legal on a read-modify-write with a memory destination.
+    // Translating anything else while silently dropping it would be a miscompile, so
+    // the interpreter gets those.
+    let kind = if lock_prefix && !lockable(&kind) {
+        InstKind::Invalid
+    } else {
+        kind
+    };
+
     let next_rip = rip.wrapping_add(offset as u64) & next_rip_mask;
     Ok(DecodedInst {
         rip,
         len: offset as u8,
         kind,
+        // Reached here means the decoder recognised the form, so it is not one of the
+        // interrupt-related opcodes below; those never decode this far.
+        assistable: true,
         next_rip,
     })
+}
+
+
+/// Whether `LOCK` is legal on this instruction, which is also exactly the set whose
+/// plain read-modify-write translation is correct on a machine that runs one CPU at
+/// a time. `CMP` is excluded: it has no destination to lock.
+fn lockable(kind: &InstKind) -> bool {
+    match kind {
+        InstKind::Alu { op, dst, .. } => {
+            matches!(dst, Operand::Mem(_))
+                && matches!(
+                    op,
+                    AluOp::Add
+                        | AluOp::Adc
+                        | AluOp::And
+                        | AluOp::Or
+                        | AluOp::Sbb
+                        | AluOp::Sub
+                        | AluOp::Xor
+                )
+        }
+        InstKind::Inc { dst, .. } | InstKind::Dec { dst, .. } => matches!(dst, Operand::Mem(_)),
+        InstKind::Neg { dst, .. } | InstKind::Not { dst, .. } => matches!(dst, Operand::Mem(_)),
+        // Both are read-modify-writes and both are overwhelmingly seen under `LOCK`.
+        InstKind::Xadd { dst, .. } | InstKind::Cmpxchg { dst, .. } => {
+            matches!(dst, Operand::Mem(_))
+        }
+        // `BT` has no write-back, so `LOCK` on it is illegal; the other three are
+        // read-modify-writes like any other.
+        InstKind::BitTest { op, dst, .. } | InstKind::BitTestReg { op, dst, .. } => {
+            matches!(dst, Operand::Mem(_)) && !matches!(op, BitOp::Test)
+        }
+        _ => false,
+    }
+}
+
+
+/// The marginal opcodes — `PREFETCH*`, `MOVNTI`, and the register-offset bit tests.
+///
+/// **On now, and they used to be off.** They measured as a 3% *loss* once: they let
+/// ~1,700 more blocks compile while the wall barely moved, because fixing the first
+/// instruction a block cannot translate often just moves the wall to a later one in
+/// the same block, and the admission cost is paid either way.
+///
+/// That was a judgement about admission economics, and admission is not what it was —
+/// a compiled module can be kept between runs (`AERO_CT_CACHE_DIR`) and the tier is
+/// two and a half times faster than when this was measured. Re-measured: **105.2
+/// against 116.0** in the 80M→200M window, and better in all four windows tried
+/// (89.0/89.2, 101.7/102.4, 92.5/97.0). They are also 12% and 9% of the remaining
+/// coverage wall by wanted executions, which is what made them worth re-testing.
+///
+/// The read-modify-writes next door are a different matter and stay off: 672.1.
+/// `AERO_X86_NO_HINT_OPS=1` goes back.
+static BITSCAN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// `BSF`/`BSR`. Built, correct, and **off, because it measured as a loss.**
+///
+/// It was the largest translatable entry left on the coverage wall — ~17,400 wanted
+/// executions — and it does what it should: the wall falls from 195,698 to 174,273 and
+/// compiled coverage rises. It is still worse in every window tried: **277.7 against
+/// 105.2** (80M→200M), 107.0 against 89.0, 104.1 against 102.4, and 322.3 against 92.5.
+///
+/// The reason is the one already written above the hint opcodes: fixing the first
+/// instruction a block cannot translate usually just moves the wall to a later one in
+/// the same block, so the extra blocks are admitted — and paid for — without becoming
+/// much more of the running. `BSF` differs from the hint opcodes only in that it lost
+/// where they won.
+///
+/// The translation is kept because it is correct and cheap to re-test: wasm has `ctz`
+/// and `clz`, and `tests/bitscan_equivalence.rs` pins the two things that are easy to
+/// get wrong — a zero source must leave the *whole* destination register alone (a
+/// 32-bit write would clear the upper half; Tier-0 does not write at all), and the
+/// architecturally undefined flags must be left exactly as Tier-0 leaves them.
+/// `AERO_X86_BITSCAN=1` turns it on.
+fn bitscan_enabled() -> bool {
+    *BITSCAN.get_or_init(|| {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            std::env::var_os("AERO_X86_BITSCAN").is_some()
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            false
+        }
+    })
+}
+
+/// Turn `BSF`/`BSR` on for a test, without going through the environment.
+pub fn force_bitscan(on: bool) {
+    let _ = BITSCAN.set(on);
+}
+
+fn hint_ops_disabled() -> bool {
+    !*HINT_OPS.get_or_init(|| {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            std::env::var_os("AERO_X86_NO_HINT_OPS").is_none()
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            true
+        }
+    })
+}
+
+static HINT_OPS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Turn the hint opcodes on for a test, without going through the environment.
+///
+/// Only takes effect before the first decode; a second call with the same value is
+/// harmless, which is what lets several tests in one binary each call it.
+pub fn force_hint_ops(on: bool) {
+    let _ = HINT_OPS.set(on);
+}
+
+
+/// Whether performing this instruction needs the interpreter's interrupt state
+/// rather than only architectural registers. See [`DecodedInst::assistable`].
+/// Measurement gates for the read-modify-writes, which are the ones whose effect on
+/// block shape is hard to predict.
+/// Off, and measured. Translating these instead of leaving them to the interpreter
+/// makes blocks that bail: enabling `XADD` adds 4,464 blocks and *loses* 3.4M guest
+/// instructions of coverage, with the average block retiring 4.33 down to 4.21.
+/// Isolated, they cost 147.9, 15.4 and 1.5 host instructions per guest instruction
+/// against a 147.7 baseline. `AERO_X86_RMW_OPS=1` turns all three on.
+fn rmw_ops_enabled() -> bool {
+    *RMW_OPS.get_or_init(|| {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            std::env::var_os("AERO_X86_RMW_OPS").is_some()
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            false
+        }
+    })
+}
+
+static RMW_OPS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Turn them on for a test, without going through the environment. Only takes effect
+/// before the first decode; repeated calls with the same value are harmless.
+pub fn force_rmw_ops(on: bool) {
+    let _ = RMW_OPS.set(on);
+}
+
+fn is_interrupt_related(m: crate::Mnemonic) -> bool {
+    use crate::Mnemonic as M;
+    matches!(
+        m,
+        M::Cli
+            | M::Sti
+            | M::Int
+            | M::Int3
+            | M::Into
+            | M::Iret
+            | M::Iretd
+            | M::Iretq
+            | M::Hlt
+            | M::Syscall
+            | M::Sysret
+            | M::Sysretq
+            | M::Sysenter
+            | M::Sysexit
+    )
 }

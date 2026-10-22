@@ -156,8 +156,7 @@ fn tier1_zero_progress_block_is_not_installed() {
         // Compilation should return `BailoutAtEntry` and must not install the block.
         let mut compiler = Tier1Compiler::new(bus, PanicRegistry).with_limits(BlockLimits {
             max_insts: 16,
-            max_bytes: 64,
-        });
+            max_bytes: 64, ..Default::default() });
 
         let res = compiler.compile_and_install(dispatcher.jit_mut(), entry, bitness);
         assert!(

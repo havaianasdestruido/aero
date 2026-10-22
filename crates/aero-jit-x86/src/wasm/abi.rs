@@ -52,6 +52,21 @@ pub const IMPORT_JIT_EXIT_MMIO: &str = "jit_exit_mmio";
 /// Bailout helper used to exit back to the runtime on unsupported IR ops or explicit bailout.
 pub const IMPORT_JIT_EXIT: &str = "jit_exit";
 
+/// `rdtsc(cpu_ptr: i32) -> i64`: the machine's timestamp counter.
+///
+/// A host call because the value comes from the machine's `TimeSource`, which the
+/// generated code has no way to reach. The host is also responsible for leaving the
+/// architectural copy in `CpuState::msr.tsc`, as the interpreter's assist does.
+pub const IMPORT_RDTSC: &str = "rdtsc";
+
+/// `assist(cpu_ptr: i32, rip: i64) -> i64`: perform one guest instruction on the
+/// host and return where the guest went next, or [`JIT_EXIT_SENTINEL_I64`] if it
+/// could not be completed — a fault, a halt, anything the interpreter has to own.
+///
+/// The block has spilled `CpuState` to linear memory before the call and reloads it
+/// after, so the host works from there rather than from any state of its own.
+pub const IMPORT_ASSIST: &str = "assist";
+
 /// Sentinel return value (`u64::MAX` as `i64`) used by Tier-1 codegen to request an
 /// interpreter fallback while still writing the precise `next_rip` into `CpuState.rip`.
 pub const JIT_EXIT_SENTINEL_I64: i64 = -1i64;

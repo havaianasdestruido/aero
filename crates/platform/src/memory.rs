@@ -307,6 +307,27 @@ impl memory::MemoryBus for MemoryBus {
     }
 
     #[inline]
+    fn is_ram(&mut self, paddr: u64) -> bool {
+        // With A20 masking active the address the guest reaches is not the one it
+        // names, so decline rather than classify the wrong page. Long mode — where
+        // compiled code runs — always has A20 enabled.
+        if !self.filter.a20_enabled() {
+            return false;
+        }
+        self.bus.is_ram(paddr)
+    }
+
+    #[inline]
+    fn read_insn_window(&mut self, paddr: u64) -> [u8; 15] {
+        if self.filter.a20_enabled() {
+            return self.bus.read_insn_window(paddr);
+        }
+        let mut buf = [0u8; 15];
+        self.read_physical_impl(paddr, &mut buf);
+        buf
+    }
+
+    #[inline]
     fn read_u8(&mut self, paddr: u64) -> u8 {
         if self.filter.a20_enabled() {
             return self.bus.read_u8(paddr);

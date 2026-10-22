@@ -10,6 +10,30 @@ pub trait MemoryBus {
     fn read_physical(&mut self, paddr: u64, buf: &mut [u8]);
     fn write_physical(&mut self, paddr: u64, buf: &[u8]);
 
+    /// Whether `paddr` is ordinary RAM rather than ROM or MMIO.
+    ///
+    /// Compiled Tier-1 code may address RAM directly through its inline TLB; MMIO
+    /// has to take a runtime exit so the device model sees the access. Defaults to
+    /// `false`, which is the conservative answer — it costs speed, not correctness.
+    fn is_ram(&mut self, _paddr: u64) -> bool {
+        false
+    }
+
+    /// Read the 15-byte instruction window at `paddr`.
+    ///
+    /// Distinct from [`read_physical`] because the length is a compile-time
+    /// constant here. The slice form cannot be inlined — the callee only sees a
+    /// runtime length — so it becomes a `memcpy` call, and this runs once per
+    /// decoded instruction. Backends over contiguous RAM should override it to
+    /// copy a fixed 15 bytes.
+    ///
+    /// [`read_physical`]: Self::read_physical
+    fn read_insn_window(&mut self, paddr: u64) -> [u8; 15] {
+        let mut buf = [0u8; 15];
+        self.read_physical(paddr, &mut buf);
+        buf
+    }
+
     fn read_u8(&mut self, paddr: u64) -> u8 {
         let mut buf = [0u8; 1];
         self.read_physical(paddr, &mut buf);
@@ -691,6 +715,26 @@ impl<M: GuestMemory> MemoryBus for PhysicalMemoryBus<M> {
     #[inline]
     fn write_physical(&mut self, paddr: u64, buf: &[u8]) {
         PhysicalMemoryBus::write_physical(self, paddr, buf)
+    }
+
+    #[inline]
+    fn is_ram(&mut self, paddr: u64) -> bool {
+        self.ram_fast_range(paddr, 1).is_some()
+    }
+
+    #[inline]
+    fn read_insn_window(&mut self, paddr: u64) -> [u8; 15] {
+        if self.ram_fast_range(paddr, 15).is_some() {
+            if let Some(src) = self.ram.get_slice(paddr, 15) {
+                let mut buf = [0u8; 15];
+                // `buf` has a constant length, so this is inline moves.
+                buf.copy_from_slice(src);
+                return buf;
+            }
+        }
+        let mut buf = [0u8; 15];
+        PhysicalMemoryBus::read_physical(self, paddr, &mut buf);
+        buf
     }
 
     #[inline]

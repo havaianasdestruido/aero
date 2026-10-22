@@ -74,7 +74,7 @@ impl CpuSnapshot {
 
         let rflags_off = abi::CPU_RFLAGS_OFF as usize;
         buf.copy_from_slice(&bytes[rflags_off..rflags_off + 8]);
-        let rflags = u64::from_le_bytes(buf);
+        let rflags = materialize_lazy_flags(bytes, u64::from_le_bytes(buf));
 
         Self { gpr, rip, rflags }
     }
@@ -168,6 +168,14 @@ pub fn write_cpu_to_wasm_bytes(cpu: &CpuState, bytes: &mut [u8]) {
     let rflags = cpu.rflags_snapshot();
     let rflags_off = abi::CPU_RFLAGS_OFF as usize;
     bytes[rflags_off..rflags_off + 8].copy_from_slice(&rflags.to_le_bytes());
+
+    // `fs:`/`gs:`-relative addressing reads these from `CpuState`.
+    for (off, value) in [
+        (abi::CPU_FS_BASE_OFF as usize, cpu.msr.fs_base),
+        (abi::CPU_GS_BASE_OFF as usize, cpu.msr.gs_base),
+    ] {
+        bytes[off..off + 8].copy_from_slice(&value.to_le_bytes());
+    }
 }
 
 /// Find a single-byte opcode that the Tier-1 minimal decoder (`aero_x86::tier1`) currently decodes
@@ -232,4 +240,62 @@ pub fn pick_invalid_opcode(bitness: u32) -> u8 {
         }
         panic!("failed to find an opcode that always decodes as InstKind::Invalid for bitness={bitness}");
     })
+}
+
+/// Fold a pending lazy-flag descriptor into an RFLAGS value.
+///
+/// Compiled code hands back the operation that produced the flags rather than the
+/// flags, so anything reading `CpuState` out of linear memory has to do what Tier-0
+/// does on a flag read. Reusing `LazyFlags` itself keeps the two from drifting: this
+/// is the same code the interpreter materialises with.
+pub fn materialize_lazy_flags(bytes: &[u8], rflags: u64) -> u64 {
+    use aero_cpu_core::state::{LazyFlagOp, LazyFlags, OperandSize};
+
+    let read_at = |off: u32| -> u64 {
+        let off = off as usize;
+        let mut b = [0u8; 8];
+        b.copy_from_slice(&bytes[off..off + 8]);
+        u64::from_le_bytes(b)
+    };
+    let header = read_at(abi::CPU_LAZY_FLAGS_OFF);
+    let op = match header as u8 {
+        1 => LazyFlagOp::Add,
+        2 => LazyFlagOp::Adc,
+        3 => LazyFlagOp::Sub,
+        4 => LazyFlagOp::Sbb,
+        5 => LazyFlagOp::Logic,
+        _ => return rflags,
+    };
+    let lazy = LazyFlags {
+        op,
+        size: match (header >> 8) as u8 {
+            1 => OperandSize::Byte,
+            2 => OperandSize::Word,
+            4 => OperandSize::Dword,
+            _ => OperandSize::Qword,
+        },
+        carry_in: ((header >> 16) & 1) as u8,
+        _pad0: [0; 5],
+        result: read_at(abi::CPU_LAZY_RESULT_OFF),
+        op1: read_at(abi::CPU_LAZY_OP1_OFF),
+        op2: read_at(abi::CPU_LAZY_OP2_OFF),
+    };
+
+    let mut r = rflags;
+    for (bit, value) in [
+        (0u32, lazy.cf()),
+        (2, lazy.pf()),
+        (4, lazy.af()),
+        (6, lazy.zf()),
+        (7, lazy.sf()),
+        (11, lazy.of()),
+    ] {
+        let mask = 1u64 << bit;
+        if value {
+            r |= mask;
+        } else {
+            r &= !mask;
+        }
+    }
+    r
 }

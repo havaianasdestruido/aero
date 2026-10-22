@@ -21,10 +21,9 @@ fn cryptsp_image() -> Option<Vec<u8>> {
     // unreadable that is a mistake worth failing on, not a reason to skip. Only
     // the *default* path is allowed to be absent.
     match std::env::var("AERO_CRYPTSP_IMAGE") {
-        Ok(path) => Some(
-            std::fs::read(&path)
-                .unwrap_or_else(|e| panic!("AERO_CRYPTSP_IMAGE={path}: {e}")),
-        ),
+        Ok(path) => {
+            Some(std::fs::read(&path).unwrap_or_else(|e| panic!("AERO_CRYPTSP_IMAGE={path}: {e}")))
+        }
         Err(_) => {
             let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/cryptsp_mapped.bin");
             match std::fs::read(path) {
@@ -356,7 +355,8 @@ fn cryptsp_pe_hasher_a298_matches_authenticode_sha256_if_fixture_present() {
     cpu.set_rip(PE_HASH);
     run_until_hlt(&mut cpu, &mut bus, 2_000_000);
     assert_eq!(
-        cpu.read_reg(Register::RAX) as u32, 0,
+        cpu.read_reg(Register::RAX) as u32,
+        0,
         "0xa298 returned {:#x}",
         cpu.read_reg(Register::RAX)
     );
@@ -402,16 +402,24 @@ fn cryptsp_pe_hasher_a298_matches_rsaenh_if_fixture_present() {
     cpu.set_rip(PE_HASH);
     run_until_hlt(&mut cpu, &mut bus, 20_000_000);
     assert_eq!(
-        cpu.read_reg(Register::RAX) as u32, 0,
+        cpu.read_reg(Register::RAX) as u32,
+        0,
         "0xa298 rsaenh returned {:#x}",
         cpu.read_reg(Register::RAX)
     );
     let mut digest = [0u8; 32];
     digest.copy_from_slice(bus.slice(DIGEST, 32));
     assert_eq!(
-        digest, expect,
+        digest,
+        expect,
         "0xa298 SHA-256 of rsaenh.dll\ngot {}\nexp {}",
-        digest.iter().map(|b| format!("{b:02x}")).collect::<String>(),
-        expect.iter().map(|b| format!("{b:02x}")).collect::<String>()
+        digest
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>(),
+        expect
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
     );
 }

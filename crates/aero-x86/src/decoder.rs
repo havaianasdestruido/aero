@@ -3019,6 +3019,26 @@ mod tests {
             Other,
         }
 
+        /// Instructions iced knows that this decoder deliberately does not implement.
+        ///
+        /// VIA PadLock only. These are `#UD` on an Intel or AMD CPU, and Aero presents an
+        /// Intel-like CPUID, so a guest reaching one gets an undefined-opcode fault —
+        /// which is what refusing to decode produces.
+        fn is_vendor_extension(m: iced_x86::Mnemonic) -> bool {
+            matches!(
+                m,
+                iced_x86::Mnemonic::Xstore
+                    | iced_x86::Mnemonic::Xcryptecb
+                    | iced_x86::Mnemonic::Xcryptcbc
+                    | iced_x86::Mnemonic::Xcryptctr
+                    | iced_x86::Mnemonic::Xcryptcfb
+                    | iced_x86::Mnemonic::Xcryptofb
+                    | iced_x86::Mnemonic::Xsha1
+                    | iced_x86::Mnemonic::Xsha256
+                    | iced_x86::Mnemonic::Montmul
+            )
+        }
+
         fn iced_valid_and_info(
             bitness: u32,
             bytes: &[u8],
@@ -3119,7 +3139,26 @@ mod tests {
                 };
 
                 let (iced_ok, iced_len, iced_ops) = iced_valid_and_info(bitness, &bytes);
+                let iced_mnemonic = {
+                    let mut d = Decoder::with_ip(bitness, &bytes, 0, DecoderOptions::NONE);
+                    d.decode().mnemonic()
+                };
                 let (ours_ok, ours_len, ours_ops) = ours_valid_and_info(mode, &bytes);
+
+                // iced decodes vendor extensions this decoder deliberately does not
+                // implement. VIA PadLock (`XSTORE`, `XCRYPT*`, `XSHA*`, `MONTMUL`) is
+                // `#UD` on the Intel-like CPU Aero presents, so refusing it is the
+                // correct answer and iced is simply the more permissive of the two.
+                // Assert that rather than skipping, so a decoder that started *accepting*
+                // them would still fail here.
+                if iced_ok && is_vendor_extension(iced_mnemonic) {
+                    prop_assert!(
+                        !ours_ok,
+                        "decoded a VIA PadLock instruction ({iced_mnemonic:?}) that is #UD \
+                         on the CPU this emulates"
+                    );
+                    return Ok(());
+                }
 
                 prop_assert_eq!(ours_ok, iced_ok);
                 if !iced_ok {

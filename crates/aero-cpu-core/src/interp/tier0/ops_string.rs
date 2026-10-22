@@ -112,6 +112,7 @@ pub fn exec<B: CpuBus>(
     Ok(ExecOutcome::Continue)
 }
 
+
 fn string_op(m: Mnemonic) -> Result<(StringOp, usize), Exception> {
     let (op, elem_size) = match m {
         Mnemonic::Movsb => (StringOp::Movs, 1),

@@ -178,6 +178,28 @@ pub const CPU_GPR_OFF: [usize; GPR_COUNT] = [
 /// Offset (in bytes) of [`CpuState::rip`].
 pub const CPU_RIP_OFF: usize = 128;
 
+/// Byte offset of the lazy-flag descriptor within [`CpuState`].
+///
+/// The first eight bytes cover `op`, `size`, `carry_in` and the padding after them,
+/// so a single 64-bit store writes the whole header. Compiled code uses this to hand
+/// back the operation that produced the flags instead of the flags themselves.
+pub const CPU_LAZY_FLAGS_OFF: usize = core::mem::offset_of!(CpuState, lazy_flags);
+pub const CPU_LAZY_RESULT_OFF: usize = CPU_LAZY_FLAGS_OFF + 8;
+pub const CPU_LAZY_OP1_OFF: usize = CPU_LAZY_FLAGS_OFF + 16;
+pub const CPU_LAZY_OP2_OFF: usize = CPU_LAZY_FLAGS_OFF + 24;
+
+/// Byte offset of the FS segment base within [`CpuState`].
+///
+/// Compiled code needs these to resolve `fs:`/`gs:`-relative addresses without a
+/// helper call. In long mode the base comes from the MSR, which is what Tier-0 reads
+/// too, so both tiers agree on what `gs:[0x188]` means.
+pub const CPU_FS_BASE_OFF: usize =
+    { core::mem::offset_of!(CpuState, msr) + core::mem::offset_of!(MsrState, fs_base) };
+
+/// Byte offset of the GS segment base within [`CpuState`]. See [`CPU_FS_BASE_OFF`].
+pub const CPU_GS_BASE_OFF: usize =
+    { core::mem::offset_of!(CpuState, msr) + core::mem::offset_of!(MsrState, gs_base) };
+
 /// Offset (in bytes) of [`CpuState::rflags`].
 pub const CPU_RFLAGS_OFF: usize = 136;
 
@@ -441,6 +463,13 @@ impl LazyFlags {
     }
 
     #[inline]
+    /// The second operand with the carry folded in.
+    ///
+    /// Kept for reference: `af`/`of` used to build their operand this way, and it is
+    /// wrong for `adc`/`sbb` whenever the low nibble of `op2 + carry` wraps — the
+    /// XOR identities want the raw operand, because they read a carry chain that
+    /// already includes the carry in.
+    #[allow(dead_code)]
     fn add_rhs(&self) -> u64 {
         self.masked_op2().wrapping_add(self.carry_in_u64()) & self.size.mask()
     }
@@ -495,11 +524,18 @@ impl LazyFlags {
         if !self.is_active() {
             return false;
         }
+        // The raw second operand, not `add_rhs`.
+        //
+        // `bit4(result) == bit4(a) ^ bit4(b) ^ carry_into_bit4` holds for a sum of any
+        // number of addends, so the identity below reads the carry out of bit 3
+        // whether or not there was a carry in. Folding the carry into `b` first
+        // breaks it exactly when the low nibble of `b + carry` wraps: `adc al, 0xff`
+        // with AL=0 and CF=1 has a real carry out of bit 3, and the folded form
+        // reports none.
         let a = self.masked_op1();
         let b = match self.op {
-            LazyFlagOp::Adc | LazyFlagOp::Sbb => self.add_rhs(),
-            LazyFlagOp::Add | LazyFlagOp::Sub => self.masked_op2(),
             LazyFlagOp::Logic | LazyFlagOp::None => 0,
+            _ => self.masked_op2(),
         };
         let r = self.masked_result();
         ((a ^ b ^ r) & 0x10) != 0
@@ -510,12 +546,12 @@ impl LazyFlags {
         if !self.is_active() {
             return false;
         }
+        // Raw second operand, for the reason given on `af`.
         let sign = self.size.sign_bit();
         let a = self.masked_op1();
         let b = match self.op {
-            LazyFlagOp::Adc | LazyFlagOp::Sbb => self.add_rhs(),
-            LazyFlagOp::Add | LazyFlagOp::Sub => self.masked_op2(),
             LazyFlagOp::Logic | LazyFlagOp::None => 0,
+            _ => self.masked_op2(),
         };
         let r = self.masked_result();
         match self.op {
@@ -1628,6 +1664,13 @@ const _: () = {
     assert!(offset_of!(CpuState, gpr) == CPU_GPR_BASE_OFF);
     assert!(offset_of!(CpuState, rip) == CPU_RIP_OFF);
     assert!(offset_of!(CpuState, rflags) == CPU_RFLAGS_OFF);
+    // The descriptor's field offsets are hard-coded above; hold them to the struct.
+    assert!(offset_of!(LazyFlags, result) == 8);
+    assert!(offset_of!(LazyFlags, op1) == 16);
+    assert!(offset_of!(LazyFlags, op2) == 24);
+    assert!(offset_of!(LazyFlags, op) == 0);
+    assert!(offset_of!(LazyFlags, size) == 1);
+    assert!(offset_of!(LazyFlags, carry_in) == 2);
 
     assert!(CPU_GPR_OFF[0] == CPU_GPR_BASE_OFF);
     assert!(CPU_GPR_OFF[15] == CPU_GPR_BASE_OFF + 15 * 8);
