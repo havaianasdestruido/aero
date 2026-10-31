@@ -46,7 +46,7 @@ type ScreenLine = { readonly row: number; readonly col: number; readonly attr: n
 const BANNER: readonly ScreenLine[] = [
   { row: 1, col: 2, attr: ATTR_BRIGHT_WHITE_ON_BLUE, text: "****  AERO EMULATOR  ****" },
   { row: 2, col: 2, attr: 0x1e, text: "A real x86 PC in your browser." },
-  { row: 3, col: 2, attr: 0x1e, text: "CPU, BIOS, VGA, keyboard: emulated." },
+  { row: 3, col: 2, attr: 0x1e, text: "BIOS, VGA and keyboard: emulated." },
   { row: 5, col: 2, attr: ATTR_GREY_ON_BLACK, text: "This boot sector is the whole OS." },
   { row: 7, col: 2, attr: 0x1a, text: "Type below. Esc clears the screen." },
 ];
@@ -370,13 +370,17 @@ export function buildDemoBootSector(): Uint8Array {
   asm.label("key_loop").xorAhAh().int(0x16); // blocking read: AL=ASCII, AH=scancode
   asm.testAlAl().jccShort(0x74, "key_loop"); // no ASCII (arrows/F-keys): ignore
 
-  asm.cmpAlImm8(0x0d).jccShort(0x74, "do_enter");
-  asm.cmpAlImm8(0x08).jccShort(0x74, "do_backspace");
-  asm.cmpAlImm8(0x1b).jccShort(0x74, "do_clear");
+  asm.cmpAlImm8(0x0d).jccNear(0x74, "do_enter");
+  asm.cmpAlImm8(0x08).jccNear(0x74, "do_backspace");
+  asm.cmpAlImm8(0x1b).jccNear(0x74, "do_clear");
   asm.call("echo_char").jmpShort("key_loop");
 
   // --- echo one character ------------------------------------------------
+  // Mirroring the character to COM1 gives headless tests (and anyone watching
+  // the serial panel) an unambiguous record of what the guest actually received,
+  // independent of what the canvas happens to be showing.
   asm.label("echo_char");
+  asm.call("putc_serial");
   asm.movBxMem(VAR_CURSOR).movDiBx().movEsDiAl().incDi();
   asm.movAlImm8(ATTR_ECHO).movEsDiAl();
   asm.addBxImm(2).movMemBx(VAR_CURSOR);
@@ -406,7 +410,7 @@ export function buildDemoBootSector(): Uint8Array {
   asm.jmpNear("key_loop");
 
   // --- enter -------------------------------------------------------------
-  asm.label("do_enter").call("newline").jmpNear("key_loop");
+  asm.label("do_enter").call("serial_crlf").call("newline").jmpNear("key_loop");
 
   // --- escape ------------------------------------------------------------
   asm.label("do_clear");
@@ -421,6 +425,15 @@ export function buildDemoBootSector(): Uint8Array {
   asm.movEsDiAl().incDi().movAlBl().movEsDiAl().incDi();
   asm.jmpShort("puts_video");
   asm.label("puts_video_done").ret();
+
+  // putc_serial: write AL to COM1. The emulated UART's FIFO never overruns at
+  // the rates a human types, so no line-status poll is needed here.
+  asm.label("putc_serial").movReg16("dx", 0x03f8).outDxAl().ret();
+
+  // serial_crlf: CR LF on COM1, so echoed lines stay readable in the log.
+  asm.label("serial_crlf");
+  asm.movAlImm8(0x0d).call("putc_serial");
+  asm.movAlImm8(0x0a).call("putc_serial").ret();
 
   // puts_serial: DS:SI -> NUL-terminated string, written to COM1 (0x3F8).
   asm.label("puts_serial").movReg16("dx", 0x03f8);

@@ -17,7 +17,13 @@ import { FRAMEBUFFER_FORMAT_RGBA8888, wrapSharedFramebuffer } from "../display/f
 import { formatOneLineError } from "../../../../packages/transport-safety/src/text.js";
 
 import { buildDemoBootSector } from "./demo_disk";
-import { isPlayerOutboundMessage, type PlayerBootDisk, type PlayerInboundMessage, type PlayerStartMessage } from "./protocol";
+import {
+  isPlayerOutboundMessage,
+  type PlayerBootDisk,
+  type PlayerInboundMessage,
+  type PlayerInputMode,
+  type PlayerStartMessage,
+} from "./protocol";
 
 const MAX_INMEMORY_IMAGE_BYTES = 128 * 1024 * 1024;
 const DEMO_RAM_BYTES = 64 * 1024 * 1024;
@@ -37,6 +43,10 @@ type PlayerTestState = {
   variant: string;
   error: string | null;
   transportCopies: number;
+  /** Keys the page forwarded to the worker (proves the DOM handler ran). */
+  keysSent: number;
+  /** How keys are delivered to the guest; see `?input=`. */
+  inputMode: PlayerInputMode;
 };
 
 const testState: PlayerTestState = {
@@ -50,6 +60,8 @@ const testState: PlayerTestState = {
   variant: "",
   error: null,
   transportCopies: 0,
+  keysSent: 0,
+  inputMode: "both",
 };
 
 declare global {
@@ -315,6 +327,7 @@ async function bootWith(disk: PlayerBootDisk | null, opts: { ramSizeBytes?: numb
     ramSizeBytes: ramBytes,
     disk,
     display: "vga",
+    input: inputMode,
   };
 
   const w = new Worker(new URL("../workers/player.worker.ts", import.meta.url), { type: "module" });
@@ -425,6 +438,7 @@ window.addEventListener("keydown", (event) => {
   }
 
   postToWorker({ type: "player.key", code: event.code, pressed: true });
+  testState.keysSent += 1;
   event.preventDefault();
 });
 
@@ -541,6 +555,17 @@ setPhase("idle");
 
 const params = new URLSearchParams(location.search);
 const autoBoot = params.get("noboot") !== "1" && params.get("noboot") !== "true";
+
+// `?input=ps2|bios|both` selects how keystrokes reach the guest. The default
+// feeds both the INT 16h queue (DOS-era guests) and the PS/2 controller
+// (OSes with their own keyboard driver); `ps2` is useful to isolate a broken
+// PS/2 path and `bios` to isolate the BIOS one.
+const requestedInput = params.get("input");
+const inputMode: PlayerInputMode =
+  requestedInput === "ps2" || requestedInput === "bios" || requestedInput === "both"
+    ? requestedInput
+    : "both";
+testState.inputMode = inputMode;
 
 // `?disk=<url>` boots a same-site image directly, which is handy for sharing a
 // link to a specific guest without re-implementing the UI.

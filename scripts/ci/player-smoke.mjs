@@ -231,22 +231,42 @@ async function main() {
     report.steps.screen = { ok: before.nonBlack > 500, nonBlack: before.nonBlack, bright: before.bright, width: before.width, height: before.height };
     if (before.nonBlack <= 500) fail("screen", `canvas is (nearly) black: ${before.nonBlack} non-black pixels`);
 
-    // Keyboard path: the demo echoes typed characters, so the screen must change.
-    // The page listens on `window`, so no click-to-focus is needed (and clicking
-    // would be at the mercy of whatever overlay the UI happens to show).
-    await page.keyboard.type("aero", { delay: 80 });
-    await page.keyboard.press("Enter");
-    await page.keyboard.type("hello from ci", { delay: 40 });
-    await page.waitForTimeout(1_200);
+    // Keyboard path, end to end: the demo echoes every accepted character to
+    // COM1 as well as to the screen, so the serial log proves the guest *ran*
+    // code in response to the key rather than merely repainting.
+    const typed = "aero ci";
+    const beforeKeys = await page.evaluate(() => window.__aeroPlayer.keysSent ?? 0);
+    const beforeFrames = await page.evaluate(() => window.__aeroPlayer.frames ?? 0);
+    await page.keyboard.type(typed, { delay: 60 });
+    await page.waitForTimeout(1_500);
 
     const after = await page.evaluate(SAMPLE_SCREEN);
-    const changed = before.checksum !== after.checksum;
+    const state = await page.evaluate(() => ({
+      serial: window.__aeroPlayer.serial ?? "",
+      keysSent: window.__aeroPlayer.keysSent ?? 0,
+      frames: window.__aeroPlayer.frames ?? 0,
+      inputMode: window.__aeroPlayer.inputMode,
+    }));
+
+    const serialEchoed = state.serial.includes(typed);
+    const repainted = before.checksum !== after.checksum;
     report.steps.keyboard = {
-      ok: changed,
+      ok: serialEchoed || repainted,
+      serialEchoed,
+      repainted,
+      inputMode: state.inputMode,
+      keysForwarded: state.keysSent - beforeKeys,
+      framesBefore: beforeFrames,
+      framesAfter: state.frames,
       checksumBefore: before.checksum,
       checksumAfter: after.checksum,
-      detail: changed ? "guest repainted after keystrokes" : "screen did not change after keystrokes",
+      detail: serialEchoed
+        ? "guest echoed the typed text on COM1"
+        : repainted
+          ? "guest repainted, but nothing reached COM1"
+          : `keys=${state.keysSent - beforeKeys}; serial=${JSON.stringify(state.serial.slice(-120))}`,
     };
+    if (!report.steps.keyboard.ok) fail("keyboard", report.steps.keyboard.detail);
 
     report.screenSketch = after.lines;
     report.pass = true;

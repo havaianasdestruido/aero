@@ -34,6 +34,7 @@ import {
 } from "../display/framebuffer_protocol";
 import type {
   PlayerInboundMessage,
+  PlayerInputMode,
   PlayerOutboundMessage,
   PlayerPhase,
   PlayerStartMessage,
@@ -68,6 +69,59 @@ type RunExitLike = { readonly kind?: number; readonly executed?: number; readonl
 /** The subset of the `aero-wasm` `Machine` API the player depends on. */
 type MachineLike = Record<string, unknown>;
 
+/**
+ * BIOS scan codes for the keys the player forwards through the INT 16h queue.
+ *
+ * Only keys with a stable scancode *and* a printable ASCII value are listed:
+ * the BIOS keystroke word is `(scan_code << 8) | ascii`, and a guest that polls
+ * INT 16h cannot do anything useful with a word whose ASCII half is zero unless
+ * it inspects the scan code itself. Function keys, arrows and modifiers are
+ * therefore left to the PS/2 path.
+ */
+const BIOS_SCAN_CODES: Readonly<Record<string, readonly [scan: number, ascii: number]>> = {
+  Enter: [0x1c, 0x0d],
+  Escape: [0x01, 0x1b],
+  Backspace: [0x0e, 0x08],
+  Tab: [0x0f, 0x09],
+  Space: [0x39, 0x20],
+  Digit1: [0x02, 0x31],
+  Digit2: [0x03, 0x32],
+  Digit3: [0x04, 0x33],
+  Digit4: [0x05, 0x34],
+  Digit5: [0x06, 0x35],
+  Digit6: [0x07, 0x36],
+  Digit7: [0x08, 0x37],
+  Digit8: [0x09, 0x38],
+  Digit9: [0x0a, 0x39],
+  Digit0: [0x0b, 0x30],
+  KeyQ: [0x10, 0x71],
+  KeyW: [0x11, 0x77],
+  KeyE: [0x12, 0x65],
+  KeyR: [0x13, 0x72],
+  KeyT: [0x14, 0x74],
+  KeyY: [0x15, 0x79],
+  KeyU: [0x16, 0x75],
+  KeyI: [0x17, 0x69],
+  KeyO: [0x18, 0x6f],
+  KeyP: [0x19, 0x70],
+  KeyA: [0x1e, 0x61],
+  KeyS: [0x1f, 0x73],
+  KeyD: [0x20, 0x64],
+  KeyF: [0x21, 0x66],
+  KeyG: [0x22, 0x67],
+  KeyH: [0x23, 0x68],
+  KeyJ: [0x24, 0x6a],
+  KeyK: [0x25, 0x6b],
+  KeyL: [0x26, 0x6c],
+  KeyZ: [0x2c, 0x7a],
+  KeyX: [0x2d, 0x78],
+  KeyC: [0x2e, 0x63],
+  KeyV: [0x2f, 0x76],
+  KeyB: [0x30, 0x62],
+  KeyN: [0x31, 0x6e],
+  KeyM: [0x32, 0x6d],
+};
+
 // --- module state ---------------------------------------------------------
 
 let machine: MachineLike | null = null;
@@ -77,6 +131,8 @@ let preferredMemory: WebAssembly.Memory | null = null;
 
 let running = false;
 let paused = false;
+/** How keys are delivered to the guest; see `PlayerStartMessage.input`. */
+let inputMode: PlayerInputMode = "both";
 let loopScheduled = false;
 let loopTimer: number | null = null;
 let runToken = 0;
@@ -506,6 +562,7 @@ async function start(msg: PlayerStartMessage, token: number): Promise<void> {
 
   const ramSizeBytes = Math.max(MIN_RAM_BYTES, Math.trunc(msg.ramSizeBytes ?? DEFAULT_RAM_BYTES));
   const display = msg.display === "aerogpu" ? "aerogpu" : "vga";
+  inputMode = msg.input === "ps2" || msg.input === "bios" ? msg.input : "both";
 
   let init: Awaited<ReturnType<typeof initWasmForContext>>;
   try {
@@ -601,12 +658,32 @@ ctx.onmessage = (ev: MessageEvent<unknown>) => {
     case "player.key": {
       const input = msg as { code?: unknown; pressed?: unknown };
       if (typeof input.code !== "string" || !machine) return;
-      const inject = machine["inject_browser_key"];
-      if (typeof inject !== "function") return;
-      try {
-        (inject as (code: string, pressed: boolean) => void).call(machine, input.code, input.pressed === true);
-      } catch {
-        /* ignore malformed key codes */
+      const pressed = input.pressed === true;
+
+      if (inputMode !== "bios") {
+        const inject = machine["inject_browser_key"];
+        if (typeof inject === "function") {
+          try {
+            (inject as (code: string, pressed: boolean) => void).call(machine, input.code, pressed);
+          } catch {
+            /* ignore malformed key codes */
+          }
+        }
+      }
+
+      // The firmware has no INT 9 handler, so a PS/2 scan code raised as IRQ1
+      // never reaches `Bios::keyboard_queue`; guests that poll INT 16h (the
+      // built-in demo, DOS, bootloaders) need the queue filled directly.
+      if (inputMode !== "ps2" && pressed) {
+        const mapping = BIOS_SCAN_CODES[input.code];
+        const push = machine["inject_bios_key"];
+        if (mapping && typeof push === "function") {
+          try {
+            (push as (key: number) => void).call(machine, ((mapping[0] << 8) | mapping[1]) & 0xffff);
+          } catch {
+            /* older builds may not expose the BIOS queue */
+          }
+        }
       }
       return;
     }

@@ -34,7 +34,23 @@ export type PlayerStartMessage = {
    * DOS-era media.
    */
   readonly display?: "vga" | "aerogpu";
+  /**
+   * How keyboard events reach the guest.
+   *
+   * - `bios`: push a BIOS keystroke word into the firmware's INT 16h queue. This
+   *   is what DOS-era guests (and the built-in demo) consume. It is the only
+   *   path that works for them: the firmware's IVT has no INT 9 handler, so a
+   *   PS/2 scan code raised as IRQ1 has nothing to translate it into the queue.
+   * - `ps2`: inject the scan code into the emulated i8042 controller. Guests
+   *   that drive the keyboard themselves (Windows, Linux) read it from there.
+   * - `both` (default): try both, so the same page works for BIOS-era and
+   *   protected-mode guests.
+   */
+  readonly input?: PlayerInputMode;
 };
+
+/** See {@link PlayerStartMessage.input}. */
+export type PlayerInputMode = "ps2" | "bios" | "both";
 
 export type PlayerInboundMessage =
   | PlayerStartMessage
