@@ -19,7 +19,7 @@
  */
 
 import { createServer } from "node:http";
-import { createReadStream, existsSync, mkdirSync, statSync, writeFileSync } from "node:fs";
+import { createReadStream, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { dirname, extname, join, normalize, resolve } from "node:path";
 import process from "node:process";
 
@@ -57,10 +57,45 @@ const MIME = new Map(
   }),
 );
 
-function startStaticServer() {
+/**
+ * Base path the artifact was built for (`/aero/` on GitHub Pages, `/` locally).
+ *
+ * Derived from the built index.html rather than hard-coded: a mismatch here is
+ * exactly the class of bug this test exists to catch, and a test that guessed
+ * the prefix would have hidden it.
+ */
+function detectBasePrefix() {
+  const explicit = (process.env.AERO_SMOKE_BASE ?? "").trim();
+  if (explicit) return explicit.endsWith("/") ? explicit : `${explicit}/`;
+  try {
+    const html = readFileSync(join(DIST, "index.html"), "utf8");
+    const match =
+      html.match(/<script[^>]+type="module"[^>]+src="([^"]+)"/i) ??
+      html.match(/<link[^>]+href="([^"]*\/assets\/[^"]+)"/i);
+    const src = match?.[1] ?? "";
+    if (src.startsWith("/")) {
+      const idx = src.indexOf("/assets/");
+      return idx <= 0 ? "/" : `${src.slice(0, idx)}/`;
+    }
+  } catch {
+    /* fall through */
+  }
+  return "/";
+}
+
+function startStaticServer(basePrefix) {
   const server = createServer((req, res) => {
     const url = new URL(req.url ?? "/", `http://${HOST}:${PORT}`);
     let pathname = decodeURIComponent(url.pathname);
+
+    // Mirror GitHub Pages: only the project sub-path is served.
+    if (!pathname.startsWith(basePrefix)) {
+      res.statusCode = 404;
+      res.setHeader("Content-Type", "text/plain; charset=utf-8");
+      res.end(`not found: ${pathname} (site is served from ${basePrefix})`);
+      return;
+    }
+    pathname = `/${pathname.slice(basePrefix.length)}`;
     if (pathname.endsWith("/")) pathname += "index.html";
 
     const filePath = join(DIST, normalize(pathname).replace(/^(\.\.[/\\])+/, ""));
@@ -136,7 +171,8 @@ async function main() {
   // Imported lazily so a missing browser install fails with a clear message.
   const { chromium } = await import("@playwright/test");
 
-  const server = await startStaticServer();
+  const basePrefix = detectBasePrefix();
+  const server = await startStaticServer(basePrefix);
   const browser = await chromium.launch({ args: ["--no-sandbox", "--disable-dev-shm-usage"] });
   const context = await browser.newContext({ viewport: { width: 1280, height: 900 } });
   const page = await context.newPage();
@@ -147,19 +183,29 @@ async function main() {
     if (consoleLines.length < 200) consoleLines.push(text);
   });
   page.on("pageerror", (err) => consoleLines.push(`pageerror: ${err.message}`));
+  const failedRequests = [];
+  page.on("response", (response) => {
+    if (response.status() >= 400) failedRequests.push(`${response.status()} ${response.url()}`);
+  });
+  page.on("requestfailed", (request) => failedRequests.push(`failed ${request.url()}`));
 
-  const report = { pass: false, steps: {}, consoleLines };
+  const report = { pass: false, base: basePrefix, steps: {}, consoleLines, failedRequests };
   const fail = (step, detail) => {
     report.steps[step] = { ok: false, detail };
     throw new Error(`${step}: ${detail}`);
   };
 
   try {
-    await page.goto(`http://${HOST}:${PORT}/`, { waitUntil: "domcontentloaded", timeout: 60_000 });
+    await page.goto(`http://${HOST}:${PORT}${basePrefix}`, { waitUntil: "domcontentloaded", timeout: 60_000 });
 
     await page
       .waitForFunction(() => window.__aeroPlayer && window.__aeroPlayer.ready === true, undefined, { timeout: 120_000 })
-      .catch((err) => fail("ready", String(err)));
+      .catch((err) => {
+        const detail = failedRequests.length
+          ? `${err} (failed requests: ${failedRequests.slice(0, 6).join(", ")})`
+          : String(err);
+        fail("ready", detail);
+      });
     report.steps.ready = { ok: true, variant: await page.evaluate(() => window.__aeroPlayer.variant) };
 
     await page
@@ -186,7 +232,8 @@ async function main() {
     if (before.nonBlack <= 500) fail("screen", `canvas is (nearly) black: ${before.nonBlack} non-black pixels`);
 
     // Keyboard path: the demo echoes typed characters, so the screen must change.
-    await page.click("#vm-canvas");
+    // The page listens on `window`, so no click-to-focus is needed (and clicking
+    // would be at the mercy of whatever overlay the UI happens to show).
     await page.keyboard.type("aero", { delay: 80 });
     await page.keyboard.press("Enter");
     await page.keyboard.type("hello from ci", { delay: 40 });
@@ -234,6 +281,10 @@ async function main() {
 
   console.log("=== aero player smoke report ===");
   console.log(JSON.stringify(report, null, 2));
+  if (report.failedRequests?.length) {
+    console.log("=== failed requests ===");
+    for (const line of report.failedRequests.slice(0, 20)) console.log(line);
+  }
   if (report.screenSketch) {
     console.log("=== screen (80x25 luminance sketch) ===");
     for (const line of report.screenSketch) console.log(`|${line}|`);

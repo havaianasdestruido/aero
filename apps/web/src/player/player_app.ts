@@ -89,7 +89,6 @@ const btnPause = byId<HTMLButtonElement>("btn-pause");
 const btnFullscreen = byId<HTMLButtonElement>("btn-fullscreen");
 const btnResetCoi = byId<HTMLButtonElement>("btn-reset-coi");
 const btnBootDemo = byId<HTMLButtonElement>("boot-demo");
-const btnBootFreedos = byId<HTMLButtonElement>("boot-freedos");
 const btnBootFile = byId<HTMLButtonElement>("boot-file");
 const btnBootFirmware = byId<HTMLButtonElement>("boot-firmware");
 
@@ -102,7 +101,6 @@ const presenter = new VgaPresenter(canvas, {
 
 let worker: Worker | null = null;
 let currentDisk: PlayerBootDisk | null = null;
-let pendingDiskPromise: Promise<PlayerBootDisk | null> | null = null;
 let paused = false;
 let running = false;
 let serialBuffer = "";
@@ -392,48 +390,6 @@ async function bootFromFile(file: File): Promise<void> {
   );
 }
 
-/** Where the deployed site keeps optional demo media (copied in by CI). */
-function demoMediaUrl(name: string): string {
-  const base = import.meta.env.BASE_URL ?? "/";
-  return new URL(`${base.replace(/\/?$/, "/")}demo/${name}`, location.href).href;
-}
-
-async function bootBundledFreeDos(): Promise<void> {
-  if (pendingDiskPromise) return;
-  const url = demoMediaUrl("freedos.img");
-  showBanner("Downloading FreeDOS (1.4 MB)…");
-  const promise = (async (): Promise<PlayerBootDisk | null> => {
-    const response = await fetch(url, { cache: "force-cache" });
-    if (!response.ok) throw new Error(`HTTP ${response.status} for ${url}`);
-    const bytes = await response.arrayBuffer();
-    return { kind: "hdd", bytes, name: "freedos.img" };
-  })();
-  pendingDiskPromise = promise;
-  try {
-    const disk = await promise;
-    if (!disk) return;
-    await bootWith(disk, { ramSizeBytes: 64 * 1024 * 1024 });
-    showBanner("FreeDOS attached. It is a 1.44 MB floppy image mounted as a hard disk; if it does not boot, try the demo disk.");
-  } catch (err) {
-    showBanner(`Could not load FreeDOS: ${formatOneLineError(err, 300)}`, "error");
-  } finally {
-    pendingDiskPromise = null;
-  }
-}
-
-/** Show the FreeDOS option only when the deployed site actually ships the image. */
-async function probeBundledMedia(): Promise<void> {
-  try {
-    const response = await fetch(demoMediaUrl("freedos.img"), { method: "HEAD" });
-    if (!response.ok) return;
-    btnBootFreedos.hidden = false;
-    const size = Number(response.headers.get("content-length") ?? "0");
-    if (size > 0) byId<HTMLSpanElement>("boot-freedos-sub").textContent = `A real 16-bit OS · ${formatBytes(size)} download`;
-  } catch {
-    /* optional */
-  }
-}
-
 // --- input -----------------------------------------------------------------
 
 const BROWSER_OWNED_KEYS = new Set(["F5", "F11", "F12"]);
@@ -543,7 +499,6 @@ btnFullscreen.addEventListener("click", () => {
 btnBootDemo.addEventListener("click", () => bootDemo());
 btnBootFirmware.addEventListener("click", () => bootFirmwareOnly());
 btnBootFile.addEventListener("click", () => fileInput.click());
-btnBootFreedos.addEventListener("click", () => void bootBundledFreeDos());
 fileInput.addEventListener("change", () => {
   const file = fileInput.files?.[0];
   fileInput.value = "";
@@ -615,4 +570,3 @@ if (diskParam) {
   });
 }
 
-void probeBundledMedia();

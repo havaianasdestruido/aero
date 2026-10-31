@@ -151,11 +151,12 @@ jobs:
           name: wasm-packages
           path: apps/web/src/wasm
 
-      - name: Fetch demo media
-        run: |
-          set -o pipefail
-          bash scripts/ci/fetch-demo-media.sh 2>&1 | tee build-logs/demo-media.log \
-            || bash scripts/ci/emit-failure-annotations.sh build-logs/demo-media.log
+      # No external demo media is fetched: the machine has no floppy controller,
+      # and a raw FreeDOS floppy image attached as a hard disk cannot boot (the
+      # guest's CHS geometry assume 18 sectors/track). The player ships a
+      # generated boot sector instead — instant, offline, and always bootable —
+      # and visitors can mount their own IMG/ISO. `scripts/ci/fetch-demo-media.sh`
+      # is kept for hosts that do implement a floppy controller.
 
       - name: Build static site
         run: |
@@ -217,6 +218,44 @@ jobs:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
+      # Failing here with a raw `HttpError: Resource not accessible by
+      # integration` is the single most confusing failure this pipeline can
+      # produce, so state the actual cause and the one-time fix up front.
+      - name: Check whether Pages is enabled
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          status=$(curl -sS -o /dev/null -w '%{http_code}' \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/pages" || echo 000)
+          echo "Pages API status: ${status}"
+          case "${status}" in
+            200)
+              echo "Pages is enabled for ${GITHUB_REPOSITORY}." ;;
+            404)
+              {
+                echo "### GitHub Pages is not enabled for this repository (one-time setup)"
+                echo
+                echo "This run built the site successfully, but GitHub refuses to publish it"
+                echo "because the repository has no Pages site yet, and the workflow token"
+                echo "cannot create one."
+                echo
+                echo "1. Open <https://github.com/${GITHUB_REPOSITORY}/settings/pages>"
+                echo "2. Set **Source** to **GitHub Actions**."
+                echo "3. Re-run this job (Actions → this run → *Re-run failed jobs*)."
+                echo
+                echo "After that, every push publishes automatically; nothing else is required."
+              } >> "$GITHUB_STEP_SUMMARY"
+              echo "::error title=GitHub Pages is not enabled::Enable it once at https://github.com/${GITHUB_REPOSITORY}/settings/pages (Source: GitHub Actions), then re-run the deploy job."
+              echo "pages_enabled=false" >> "$GITHUB_OUTPUT" ;;
+            *)
+              echo "::warning title=Could not determine Pages status::The Pages API returned ${status}; continuing anyway."
+              echo "pages_enabled=unknown" >> "$GITHUB_OUTPUT" ;;
+          esac
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Configure Pages
         uses: actions/configure-pages@v5
         with:
