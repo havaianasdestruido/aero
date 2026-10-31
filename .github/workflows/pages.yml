@@ -31,7 +31,7 @@ jobs:
   wasm:
     name: Build WASM (threaded + single)
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 150
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -42,7 +42,6 @@ jobs:
           rustup toolchain install 1.92.0 --profile minimal --target wasm32-unknown-unknown
           rustup toolchain install nightly-2025-12-08 --profile minimal --target wasm32-unknown-unknown
           rustup component add rust-src --toolchain nightly-2025-12-08
-          rustup target add wasm32-unknown-unknown --toolchain 1.92.0
           rustup default 1.92.0
           rustc --version
           cargo --version
@@ -71,34 +70,30 @@ jobs:
           pnpm --version
 
       - name: Install JS dependencies
-        run: pnpm install --frozen-lockfile
+        run: |
+          set -o pipefail
+          mkdir -p build-logs
+          pnpm install --frozen-lockfile 2>&1 | tee build-logs/install.log \
+            || bash scripts/ci/emit-failure-annotations.sh build-logs/install.log
+
+      - name: Show tooling
+        run: |
+          set -euo pipefail
+          pnpm exec wasm-pack --version
 
       - name: Build WASM packages (single-threaded)
         run: |
           set -o pipefail
-          mkdir -p build-logs
-          pnpm -C apps/web run wasm:build:single -- --packages core,gpu 2>&1 \
-            | tee build-logs/wasm-single.log || bash scripts/ci/emit-failure-annotations.sh build-logs/wasm-single.log
-        env:
-          AERO_WASM_PACKAGES: core,gpu
+          pnpm exec node apps/web/scripts/build_wasm.mjs single release --packages core,gpu 2>&1 \
+            | tee build-logs/wasm-single.log \
+            || bash scripts/ci/emit-failure-annotations.sh build-logs/wasm-single.log
 
       - name: Build WASM packages (threaded / shared memory)
         run: |
           set -o pipefail
-          mkdir -p build-logs
-          pnpm -C apps/web run wasm:build:threaded -- --packages core,gpu 2>&1 \
-            | tee build-logs/wasm-threaded.log || bash scripts/ci/emit-failure-annotations.sh build-logs/wasm-threaded.log
-        env:
-          AERO_WASM_PACKAGES: core,gpu
-
-      - name: Upload build logs
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: build-logs
-          path: build-logs
-          if-no-files-found: ignore
-          retention-days: 7
+          pnpm exec node apps/web/scripts/build_wasm.mjs threaded release --packages core,gpu 2>&1 \
+            | tee build-logs/wasm-threaded.log \
+            || bash scripts/ci/emit-failure-annotations.sh build-logs/wasm-threaded.log
 
       - name: Report WASM sizes
         run: |
@@ -111,6 +106,15 @@ jobs:
           name: wasm-packages
           path: apps/web/src/wasm/pkg-*
           if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wasm-build-logs
+          path: build-logs
+          if-no-files-found: ignore
           retention-days: 7
 
   web:
@@ -135,7 +139,11 @@ jobs:
           pnpm --version
 
       - name: Install JS dependencies
-        run: pnpm install --frozen-lockfile
+        run: |
+          set -o pipefail
+          mkdir -p build-logs
+          pnpm install --frozen-lockfile 2>&1 | tee build-logs/install-web.log \
+            || bash scripts/ci/emit-failure-annotations.sh build-logs/install-web.log
 
       - name: Download WASM packages
         uses: actions/download-artifact@v4
@@ -144,10 +152,16 @@ jobs:
           path: apps/web/src/wasm
 
       - name: Fetch demo media
-        run: bash scripts/ci/fetch-demo-media.sh
+        run: |
+          set -o pipefail
+          bash scripts/ci/fetch-demo-media.sh 2>&1 | tee build-logs/demo-media.log \
+            || bash scripts/ci/emit-failure-annotations.sh build-logs/demo-media.log
 
       - name: Build static site
-        run: pnpm run build
+        run: |
+          set -o pipefail
+          pnpm run build 2>&1 | tee build-logs/build-web.log \
+            || bash scripts/ci/emit-failure-annotations.sh build-logs/build-web.log
         env:
           # Served from https://<owner>.github.io/<repo>/
           VITE_BASE: /${{ github.event.repository.name }}/
@@ -159,6 +173,15 @@ jobs:
           set -euo pipefail
           du -sh dist
           find dist -maxdepth 2 -type f | head -50
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-build-logs
+          path: build-logs
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
