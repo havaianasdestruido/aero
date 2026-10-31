@@ -258,7 +258,11 @@ async function main() {
     const beforeKeys = await page.evaluate(() => window.__aeroPlayer.keysSent ?? 0);
     const beforeFrames = await page.evaluate(() => window.__aeroPlayer.frames ?? 0);
     await page.keyboard.type(typed, { delay: 60 });
-    await page.waitForTimeout(1_500);
+    await page
+      .waitForFunction((text) => (window.__aeroPlayer?.serial ?? "").includes(text), typed, { timeout: 4_000 })
+      .catch(() => {
+        /* the report below explains what did happen */
+      });
 
     const after = await page.evaluate(SAMPLE_SCREEN);
     if (after) report.screenSketch = after.lines;
@@ -273,7 +277,7 @@ async function main() {
     const serialEchoed = state.serial.includes(typed);
     const repainted = before.checksum !== after.checksum;
     report.steps.keyboard = {
-      ok: serialEchoed || repainted,
+      ok: serialEchoed,
       serialEchoed,
       repainted,
       inputMode: state.inputMode,
@@ -285,9 +289,8 @@ async function main() {
       checksumAfter: after.checksum,
       detail: serialEchoed
         ? "guest echoed the typed text on COM1"
-        : repainted
-          ? "guest repainted, but nothing reached COM1"
-          : `keys=${state.keysSent - beforeKeys} ips=${state.ips} serial=${JSON.stringify(state.serial.slice(-160))}`,
+        : `guest never echoed. keys=${state.keysSent - beforeKeys} ips=${state.ips} ` +
+          `repainted=${repainted} serial=${JSON.stringify(state.serial.slice(-200))}`,
     };
     if (!report.steps.keyboard.ok) fail("keyboard", report.steps.keyboard.detail);
 
@@ -354,7 +357,12 @@ async function main() {
   const steps = Object.entries(report.steps)
     .map(([name, value]) => `${name}=${value.ok ? "ok" : "FAIL"}`)
     .join(" ");
-  annotate("notice", "player smoke passed", `${steps} frames=${report.steps.frames?.frames ?? "?"} serial=${JSON.stringify(report.steps.serial?.serial ?? "")}`);
+  annotate(
+    "notice",
+    "player smoke passed",
+    `${steps} frames=${report.steps.frames?.frames ?? "?"} serial=${JSON.stringify(report.steps.serial?.serial ?? "")} ` +
+      `keyboard=${JSON.stringify(report.steps.keyboard ?? null)}`,
+  );
   if (report.screenSketch) annotate("notice", "player screen", sketchSummary(report.screenSketch));
   console.log("RESULT: PASS");
 }
