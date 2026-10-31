@@ -208,6 +208,8 @@ export default defineConfig({
       // The harness preview server (port 4173) is used for COOP/COEP + CSP matrix tests.
       // Both application entry points are built so the matrix covers each of them.
       input: {
+        // The public player page (what the deployed static site serves at `/`).
+        player: fileURLToPath(new URL('./index.html', import.meta.url)),
         main: fileURLToPath(new URL('./apps/web/index.html', import.meta.url)),
         // The fuller shell used for manual Windows 7 bring-up.
         bringup: fileURLToPath(new URL('./apps/web/bringup.html', import.meta.url)),

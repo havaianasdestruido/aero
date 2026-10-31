@@ -168,6 +168,27 @@ jobs:
           GIT_SHA: ${{ github.sha }}
           AERO_VERSION: ${{ github.ref_name }}
 
+      - name: Install Playwright Chromium
+        run: |
+          set -euo pipefail
+          pnpm exec playwright install --with-deps chromium
+
+      # Boots the *built* artifact in headless Chromium and asserts the guest
+      # comes up: ready state, frames presented, the bundled demo boot sector
+      # announcing itself on COM1, non-black pixels on the canvas, and a repaint
+      # after keystrokes. Non-blocking for the deploy so a flaky headless runner
+      # cannot keep the site offline, but a failure is surfaced as an annotation
+      # (and in build-logs/player-smoke-report.json) instead of being swallowed.
+      - name: Smoke test the built player
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          node scripts/ci/player-smoke.mjs 2>&1 | tee build-logs/player-smoke.log
+        env:
+          AERO_SMOKE_PORT: "8123"
+          AERO_SMOKE_REPORT: build-logs/player-smoke-report.json
+          AERO_SMOKE_SCREENSHOT: build-logs/player-smoke.png
+
       - name: Show output
         run: |
           set -euo pipefail
