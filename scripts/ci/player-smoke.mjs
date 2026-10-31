@@ -354,6 +354,50 @@ async function main() {
       await plainContext.close().catch(() => {});
     }
 
+    // Third scenario: the exact production path. GitHub Pages sends no
+    // COOP/COEP, so the page registers the isolation service worker, reloads
+    // once, and only then gets `SharedArrayBuffer`. If that shim is broken the
+    // deployed site is a dead page, so it is asserted here rather than assumed.
+    const swContext = await browser.newContext({ viewport: { width: 1280, height: 900 } });
+    const swPage = await swContext.newPage();
+    const swConsole = [];
+    swPage.on("console", (msg) => {
+      if (swConsole.length < 80) swConsole.push(`${msg.type()}: ${msg.text()}`);
+    });
+    swPage.on("pageerror", (err) => swConsole.push(`pageerror: ${err.message}`));
+
+    try {
+      await swPage.goto(`http://${HOST}:${PORT}${basePrefix}`, { waitUntil: "domcontentloaded", timeout: 60_000 });
+      await swPage
+        .waitForFunction(() => window.crossOriginIsolated === true, undefined, { timeout: 45_000 })
+        .catch((err) => fail("isolationShim", `page never became cross-origin isolated: ${err}`));
+      await swPage.waitForFunction(() => window.__aeroPlayer?.ready === true, undefined, { timeout: 120_000 });
+      await swPage.waitForFunction(
+        () => (window.__aeroPlayer?.serial ?? "").includes("AERO-DEMO-BOOT-OK"),
+        undefined,
+        { timeout: 90_000 },
+      );
+      await swPage.waitForFunction(() => (window.__aeroPlayer?.frames ?? 0) > 1, undefined, { timeout: 60_000 });
+
+      const swState = await swPage.evaluate(() => ({
+        isolated: window.crossOriginIsolated === true,
+        transport: window.__aeroPlayer.transport,
+        frames: window.__aeroPlayer.frames,
+        sharedBuffer: typeof SharedArrayBuffer !== "undefined",
+      }));
+      report.steps.isolationShim = {
+        ok: swState.isolated && swState.transport === "shared" && swState.frames > 1,
+        ...swState,
+        detail: `service worker produced isolation=${swState.isolated}, transport=${swState.transport}, frames=${swState.frames}`,
+      };
+      if (!report.steps.isolationShim.ok) fail("isolationShim", report.steps.isolationShim.detail);
+    } catch (err) {
+      report.steps.isolationShim ??= { ok: false, detail: String(err), consoleLines: swConsole.slice(-10) };
+      throw err;
+    } finally {
+      await swContext.close().catch(() => {});
+    }
+
     report.pass = true;
   } catch (err) {
     report.error = String(err && err.message ? err.message : err);
