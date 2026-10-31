@@ -132,7 +132,7 @@ let preferredMemory: WebAssembly.Memory | null = null;
 let running = false;
 let paused = false;
 /** How keys are delivered to the guest; see `PlayerStartMessage.input`. */
-let inputMode: PlayerInputMode = "both";
+let inputMode: PlayerInputMode = "bios";
 let loopScheduled = false;
 let loopTimer: number | null = null;
 let runToken = 0;
@@ -562,7 +562,7 @@ async function start(msg: PlayerStartMessage, token: number): Promise<void> {
 
   const ramSizeBytes = Math.max(MIN_RAM_BYTES, Math.trunc(msg.ramSizeBytes ?? DEFAULT_RAM_BYTES));
   const display = msg.display === "aerogpu" ? "aerogpu" : "vga";
-  inputMode = msg.input === "ps2" || msg.input === "bios" ? msg.input : "both";
+  inputMode = msg.input === "ps2" || msg.input === "both" ? msg.input : "bios";
 
   let init: Awaited<ReturnType<typeof initWasmForContext>>;
   try {

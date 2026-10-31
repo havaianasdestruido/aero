@@ -43,8 +43,9 @@ export type PlayerStartMessage = {
    *   PS/2 scan code raised as IRQ1 has nothing to translate it into the queue.
    * - `ps2`: inject the scan code into the emulated i8042 controller. Guests
    *   that drive the keyboard themselves (Windows, Linux) read it from there.
-   * - `both` (default): try both, so the same page works for BIOS-era and
-   *   protected-mode guests.
+   *   Note that the firmware has no INT 9 handler, so this path does *not*
+   *   reach DOS-era guests polling INT 16h.
+   * - `both`: feed both paths, for a page that may host either kind of guest.
    */
   readonly input?: PlayerInputMode;
 };

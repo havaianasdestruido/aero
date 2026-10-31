@@ -77,12 +77,13 @@ const SERIAL_LOG_LIMIT = 60_000;
 /**
  * How keystrokes reach the guest; `?input=ps2|bios|both` overrides the default.
  *
- * `both` is right for a public page: BIOS-era guests poll INT 16h, while OSes
- * with their own keyboard driver read the emulated i8042.
+ * The default is `bios`: the firmware installs no INT 9 handler, so ps/2 scan
+ * codes raised as IRQ1 cannot reach the INT 16h queue that BIOS-era guests poll.
+ * `?input=ps2` (or `both`) is there for guests that drive the i8042 themselves.
  */
 const inputMode: PlayerInputMode = (() => {
   const requested = new URLSearchParams(location.search).get("input");
-  return requested === "ps2" || requested === "bios" || requested === "both" ? requested : "both";
+  return requested === "ps2" || requested === "bios" || requested === "both" ? requested : "bios";
 })();
 
 // --- state -----------------------------------------------------------------
@@ -117,7 +118,7 @@ const testState: PlayerTestState = {
   error: null,
   transportCopies: 0,
   keysSent: 0,
-  inputMode: "both",
+  inputMode: "bios",
 };
 
 /** See {@link testState}. */
@@ -395,9 +396,7 @@ function startMachine(disk: PlayerBootDisk | null, ramSizeBytes: number): void {
     ramSizeBytes,
     disk,
     display: "vga",
-    // Both paths by default: the INT 16h queue for BIOS-era guests (the demo
-    // disk, DOS) and the PS/2 controller for OSes that drive the keyboard
-    // themselves. `?input=ps2|bios` narrows it for debugging.
+    // The INT 16h queue by default (see `inputMode`); `?input=` switches it.
     input: inputMode,
   };
   w.postMessage(message);

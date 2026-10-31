@@ -5987,6 +5987,20 @@ impl Machine {
         self.inner.inject_browser_key(code, pressed);
     }
 
+    /// Inject a classic BIOS keyboard word into the firmware's INT 16h queue.
+    ///
+    /// `key` is `(scan_code << 8) | ascii`, the historical BIOS encoding.
+    ///
+    /// This is the only keyboard path available to guests that poll INT 16h
+    /// (the DOS-era demo disk, bootloaders, most DOS software): the firmware
+    /// does not install an INT 9 handler, so a PS/2 scan code delivered through
+    /// [`Machine::inject_browser_key`] is never translated into this queue.
+    /// Modern guests should keep using the PS/2 path, which they drive
+    /// themselves.
+    pub fn inject_bios_key(&mut self, key: u16) {
+        self.inner.inject_bios_key(key);
+    }
+
     /// Inject up to 4 raw PS/2 Set-2 scancode bytes into the guest i8042 keyboard device.
     ///
     /// This matches the format used by `web/src/input/event_queue.ts` (`InputEventType.KeyScancode`):

@@ -34,6 +34,19 @@ function escapeCommandData(value) {
   return String(value).replace(/%/g, "%25").replace(/\r/g, "%0D").replace(/\n/g, "%0A");
 }
 
+/**
+ * The emulated screen, as coarse luminance, so a reviewer reading only the
+ * checks API can see what the guest actually drew.
+ */
+function sketchSummary(lines) {
+  return lines
+    .slice(0, 14)
+    .map((line) => line.replace(/\s+$/, ""))
+    .filter((line, index, all) => line.length > 0 || all.slice(index + 1).some((next) => next.length > 0))
+    .join("\n")
+    .slice(0, 1200);
+}
+
 function annotate(level, title, message) {
   if (!inActions) return;
   console.log(`::${level} title=${escapeCommandData(title)}::${escapeCommandData(message)}`);
@@ -320,6 +333,7 @@ async function main() {
     }
     if (report.error) annotate("error", "player smoke: failure", report.error.slice(0, 1500));
     for (const line of report.consoleLines.slice(-10)) annotate("error", "player console", line.slice(0, 500));
+    if (report.screenSketch) annotate("error", "player screen", sketchSummary(report.screenSketch));
     if (report.consoleLines.length) {
       console.log("=== console ===");
       for (const line of report.consoleLines) console.log(line);
@@ -331,6 +345,7 @@ async function main() {
     .map(([name, value]) => `${name}=${value.ok ? "ok" : "FAIL"}`)
     .join(" ");
   annotate("notice", "player smoke passed", `${steps} frames=${report.steps.frames?.frames ?? "?"} serial=${JSON.stringify(report.steps.serial?.serial ?? "")}`);
+  if (report.screenSketch) annotate("notice", "player screen", sketchSummary(report.screenSketch));
   console.log("RESULT: PASS");
 }
 
