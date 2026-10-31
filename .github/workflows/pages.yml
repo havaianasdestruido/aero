@@ -214,6 +214,16 @@ jobs:
     name: Deploy to GitHub Pages
     needs: web
     runs-on: ubuntu-latest
+    # Only the default branch may publish. The `github-pages` environment's
+    # deployment branch policy allows `main` alone, so a run from any other
+    # branch would fail at the deploy step with an environment-protection error
+    # that looks like a bug. Branches still build and smoke-test the artifact;
+    # publishing happens when the work lands on `main`.
+    #
+    # To preview a branch instead, add it under Settings -> Environments ->
+    # github-pages -> Deployment branches, then relax this condition (or
+    # dispatch this workflow from that branch).
+    if: github.ref_name == github.event.repository.default_branch
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}

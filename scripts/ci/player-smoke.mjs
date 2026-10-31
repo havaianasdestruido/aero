@@ -121,9 +121,12 @@ function startStaticServer(basePrefix) {
 
     res.statusCode = 200;
     res.setHeader("Content-Type", MIME.get(extname(filePath).toLowerCase()) ?? "application/octet-stream");
-    // Mirrors what the isolation service worker does on a static host.
-    res.setHeader("Cross-Origin-Opener-Policy", "same-origin");
-    res.setHeader("Cross-Origin-Embedder-Policy", "require-corp");
+    // GitHub Pages cannot send these headers at all. `?headers=plain` reproduces
+    // that, so the copy-transport fallback gets exercised instead of assumed.
+    if (url.searchParams.get("headers") !== "plain") {
+      res.setHeader("Cross-Origin-Opener-Policy", "same-origin");
+      res.setHeader("Cross-Origin-Embedder-Policy", "require-corp");
+    }
     res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
     res.setHeader("Cache-Control", "no-store");
     createReadStream(filePath).pipe(res);
@@ -294,12 +297,6 @@ async function main() {
     };
     if (!report.steps.keyboard.ok) fail("keyboard", report.steps.keyboard.detail);
 
-    report.pass = true;
-  } catch (err) {
-    report.error = String(err && err.message ? err.message : err);
-  } finally {
-    // Artifacts are captured while the page is still alive: CI annotates
-    // failures from this log, and reviewers can open the PNG after the fact.
     if (reportScreenshot) {
       try {
         mkdirSync(dirname(reportScreenshot), { recursive: true });
@@ -309,6 +306,58 @@ async function main() {
         report.screenshotError = String(err);
       }
     }
+
+    // Second scenario: the same artifact on a host that cannot send COOP/COEP
+    // (i.e. exactly GitHub Pages, before the service worker takes over). The
+    // emulator must still boot, just with copied frames instead of shared
+    // memory, so a visitor never ends up with a dead page.
+    await context.close().catch(() => {});
+    const plainContext = await browser.newContext({ viewport: { width: 1280, height: 900 } });
+    const plainPage = await plainContext.newPage();
+    const plainConsole = [];
+    plainPage.on("console", (msg) => {
+      if (plainConsole.length < 80) plainConsole.push(`${msg.type()}: ${msg.text()}`);
+    });
+    plainPage.on("pageerror", (err) => plainConsole.push(`pageerror: ${err.message}`));
+
+    try {
+      await plainPage.goto(`http://${HOST}:${PORT}${basePrefix}?headers=plain&no-coi=1`, {
+        waitUntil: "domcontentloaded",
+        timeout: 60_000,
+      });
+      await plainPage.waitForFunction(() => window.__aeroPlayer?.ready === true, undefined, { timeout: 120_000 });
+      await plainPage.waitForFunction(
+        () => (window.__aeroPlayer?.serial ?? "").includes("AERO-DEMO-BOOT-OK"),
+        undefined,
+        { timeout: 90_000 },
+      );
+      await plainPage.waitForFunction(() => (window.__aeroPlayer?.frames ?? 0) > 1, undefined, { timeout: 60_000 });
+
+      const planState = await plainPage.evaluate(() => ({
+        transport: window.__aeroPlayer.transport,
+        frames: window.__aeroPlayer.frames,
+        copies: window.__aeroPlayer.transportCopies,
+        isolated: window.crossOriginIsolated === true,
+      }));
+      report.steps.copyTransport = {
+        ok: planState.frames > 1,
+        ...planState,
+        detail: planState.isolated
+          ? "unexpected: page reported cross-origin isolation without headers"
+          : `${planState.frames} frames via ${planState.transport} transport, ${planState.copies} copied`,
+      };
+      if (!report.steps.copyTransport.ok) fail("copyTransport", report.steps.copyTransport.detail);
+    } catch (err) {
+      report.steps.copyTransport = { ok: false, detail: String(err), consoleLines: plainConsole.slice(-10) };
+      throw err;
+    } finally {
+      await plainContext.close().catch(() => {});
+    }
+
+    report.pass = true;
+  } catch (err) {
+    report.error = String(err && err.message ? err.message : err);
+  } finally {
     if (reportPath) {
       try {
         mkdirSync(dirname(reportPath), { recursive: true });
