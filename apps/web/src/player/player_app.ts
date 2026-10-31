@@ -1,21 +1,23 @@
-// Main-thread controller for the public player page.
+// Main-thread controller for the public player page (repo-root `index.html`).
 //
 // Responsibilities, in order of importance:
-//  1. Boot something on arrival (the generated demo disk), so a visitor sees a
-//     live computer without configuring anything.
-//  2. Let the visitor choose other boot media — a bundled DOS image or a local
-//     disk image — and stay out of the way while it boots.
-//  3. Present the guest display and forward keyboard/mouse input.
+//   1. Start the emulator worker and route the guest display to the canvas.
+//   2. Forward keyboard/mouse input.
+//   3. Keep the surrounding chrome (status, serial log, statistics) honest.
 //
-// The guest itself never runs here: `workers/player.worker.ts` owns the machine.
-// This file only talks to it over the small protocol in `./protocol.ts`.
+// All emulation happens in `workers/player.worker.ts`; this file never touches
+// emulator internals, so the guest cannot stall the UI thread.
+//
+// The page deliberately keeps working without cross-origin isolation (and
+// therefore without `SharedArrayBuffer`): frames then arrive as copies at a
+// slightly lower rate. That fallback is what makes plain GitHub Pages hosting
+// viable, since it cannot send COOP/COEP headers.
 
 import "./player.css";
 
 import { VgaPresenter } from "../display/vga_presenter";
 import { FRAMEBUFFER_FORMAT_RGBA8888, wrapSharedFramebuffer } from "../display/framebuffer_protocol";
 import { formatOneLineError } from "../../../../packages/transport-safety/src/text.js";
-
 import { buildDemoBootSector } from "./demo_disk";
 import {
   isPlayerOutboundMessage,
@@ -25,54 +27,11 @@ import {
   type PlayerStartMessage,
 } from "./protocol";
 
-const MAX_INMEMORY_IMAGE_BYTES = 128 * 1024 * 1024;
-const DEMO_RAM_BYTES = 64 * 1024 * 1024;
-const SERIAL_LOG_LIMIT = 24_000;
-
-type Phase = "idle" | "starting" | "booting" | "running" | "paused" | "stopped" | "error";
-
-/** State mirrored onto `window.__aeroPlayer` for headless smoke tests. */
-type PlayerTestState = {
-  ready: boolean;
-  phase: Phase;
-  serial: string;
-  frames: number;
-  width: number;
-  height: number;
-  transport: "shared" | "copy" | "none";
-  variant: string;
-  error: string | null;
-  transportCopies: number;
-  /** Keys the page forwarded to the worker (proves the DOM handler ran). */
-  keysSent: number;
-  /** How keys are delivered to the guest; see `?input=`. */
-  inputMode: PlayerInputMode;
-};
-
-const testState: PlayerTestState = {
-  ready: false,
-  phase: "idle",
-  serial: "",
-  frames: 0,
-  width: 0,
-  height: 0,
-  transport: "none",
-  variant: "",
-  error: null,
-  transportCopies: 0,
-  keysSent: 0,
-  inputMode: "both",
-};
-
-declare global {
-  interface Window {
-    __aeroPlayer?: PlayerTestState;
-  }
-}
+// --- DOM -------------------------------------------------------------------
 
 function byId<T extends HTMLElement>(id: string): T {
   const element = document.getElementById(id);
-  if (!element) throw new Error(`Missing #${id}`);
+  if (!element) throw new Error(`player: missing #${id}`);
   return element as T;
 }
 
@@ -104,24 +63,84 @@ const btnBootDemo = byId<HTMLButtonElement>("boot-demo");
 const btnBootFile = byId<HTMLButtonElement>("boot-file");
 const btnBootFirmware = byId<HTMLButtonElement>("boot-firmware");
 
-const presenter = new VgaPresenter(canvas, {
-  scaleMode: "pixelated",
-  integerScaling: false,
-  autoResizeToClient: true,
-  maxPresentHz: 60,
-});
+// --- tunables --------------------------------------------------------------
+
+/** Images are copied into the wasm heap, so the page caps what it accepts. */
+const MAX_INMEMORY_IMAGE_BYTES = 128 * 1024 * 1024;
+/** Guest RAM for the built-in demo. */
+const DEMO_RAM_BYTES = 32 * 1024 * 1024;
+/** Guest RAM when the visitor supplies their own image. */
+const IMAGE_RAM_BYTES = 64 * 1024 * 1024;
+/** Keep the serial panel bounded even for chatty guests. */
+const SERIAL_LOG_LIMIT = 60_000;
+
+/**
+ * How keystrokes reach the guest; `?input=ps2|bios|both` overrides the default.
+ *
+ * `both` is right for a public page: BIOS-era guests poll INT 16h, while OSes
+ * with their own keyboard driver read the emulated i8042.
+ */
+const inputMode: PlayerInputMode = (() => {
+  const requested = new URLSearchParams(location.search).get("input");
+  return requested === "ps2" || requested === "bios" || requested === "both" ? requested : "both";
+})();
+
+// --- state -----------------------------------------------------------------
+
+type Phase = "idle" | "starting" | "booting" | "running" | "paused" | "stopped" | "error";
 
 let worker: Worker | null = null;
-let currentDisk: PlayerBootDisk | null = null;
+let presenter: VgaPresenter | null = null;
+let phase: Phase = "idle";
 let paused = false;
-let running = false;
-let serialBuffer = "";
+let serialLog = "";
+let bootGeneration = 0;
+/** What `Reboot` should re-attach. */
+let lastBoot: { disk: PlayerBootDisk | null; ramSizeBytes: number } | null = null;
 
-// --- small helpers ---------------------------------------------------------
+/**
+ * Live state mirrored onto `window.__aeroPlayer`.
+ *
+ * The headless smoke test in CI reads this instead of scraping the DOM: a
+ * canvas assertion can only say "some pixels changed", while this can say the
+ * guest consumed a keystroke and echoed it on COM1.
+ */
+const testState: PlayerTestState = {
+  ready: false,
+  phase: "idle",
+  serial: "",
+  frames: 0,
+  width: 0,
+  height: 0,
+  transport: "none",
+  variant: "",
+  error: null,
+  transportCopies: 0,
+  keysSent: 0,
+  inputMode: "both",
+};
 
-function setPhase(next: Phase, detail?: string): void {
+/** See {@link testState}. */
+type PlayerTestState = {
+  ready: boolean;
+  phase: Phase;
+  serial: string;
+  frames: number;
+  width: number;
+  height: number;
+  transport: "shared" | "copy" | "none";
+  variant: string;
+  error: string | null;
+  transportCopies: number;
+  keysSent: number;
+  inputMode: PlayerInputMode;
+};
+
+// --- chrome ----------------------------------------------------------------
+
+function setStatus(next: Phase, detail?: string): void {
+  phase = next;
   testState.phase = next;
-  statusPill.dataset.state = next === "booting" || next === "starting" ? "booting" : next;
   const labels: Record<Phase, string> = {
     idle: "idle",
     starting: "starting…",
@@ -132,280 +151,309 @@ function setPhase(next: Phase, detail?: string): void {
     error: "error",
   };
   statusText.textContent = detail ? `${labels[next]} — ${detail}` : labels[next];
-  btnPause.disabled = !running;
-  btnPause.textContent = paused ? "Resume" : "Pause";
+  const state =
+    next === "running" ? "running" : next === "error" ? "error" : next === "idle" || next === "stopped" ? "off" : "loading";
+  statusPill.dataset.state = state;
+  statusPill.title = detail ?? labels[next];
 }
 
-function showOverlay(opts: { title: string; text?: string; detail?: string; spinner?: boolean; error?: boolean }): void {
+function showOverlay(options: {
+  title: string;
+  text?: string;
+  detail?: string;
+  spinner?: boolean;
+  error?: boolean;
+}): void {
   overlay.hidden = false;
-  overlay.classList.toggle("error", opts.error === true);
-  overlaySpinner.hidden = opts.spinner !== true;
-  overlayTitle.textContent = opts.title;
-  overlayText.textContent = opts.text ?? "";
-  overlayDetail.textContent = opts.detail ?? "";
+  overlay.classList.toggle("error", options.error === true);
+  overlaySpinner.hidden = options.spinner !== true;
+  overlayTitle.textContent = options.title;
+  overlayText.textContent = options.text ?? "";
+  overlayDetail.textContent = options.detail ?? "";
 }
 
 function hideOverlay(): void {
   overlay.hidden = true;
 }
 
-function showBanner(message: string, kind: "info" | "error" = "info"): void {
+function setBanner(text: string, kind: "info" | "error" = "info"): void {
+  if (!text) {
+    bootBanner.hidden = true;
+    bootBanner.textContent = "";
+    return;
+  }
   bootBanner.hidden = false;
+  bootBanner.textContent = text;
   bootBanner.classList.toggle("error", kind === "error");
-  bootBanner.textContent = message;
-}
-
-function hideBanner(): void {
-  bootBanner.hidden = true;
 }
 
 function formatBytes(bytes: number): string {
-  if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-  if (bytes >= 1024) return `${Math.round(bytes / 1024)} KB`;
-  return `${bytes} B`;
+  if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
+  const units = ["B", "KiB", "MiB", "GiB"];
+  let value = bytes;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit += 1;
+  }
+  return `${value >= 100 || unit === 0 ? Math.round(value) : value.toFixed(1)} ${units[unit]}`;
 }
 
-function formatRate(ips: number): string {
-  if (ips >= 1_000_000_000) return `${(ips / 1_000_000_000).toFixed(2)} GIPS`;
-  if (ips >= 1_000_000) return `${(ips / 1_000_000).toFixed(1)} MIPS`;
-  if (ips >= 1_000) return `${(ips / 1_000).toFixed(1)} KIPS`;
-  return `${ips} IPS`;
+function formatRate(value: number): string {
+  if (!Number.isFinite(value) || value <= 0) return "—";
+  if (value >= 1_000_000_000) return `${(value / 1_000_000_000).toFixed(2)} GIPS`;
+  if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1)} MIPS`;
+  if (value >= 1_000) return `${(value / 1_000).toFixed(0)} kIPS`;
+  return `${Math.round(value)} IPS`;
 }
 
-// --- worker plumbing -------------------------------------------------------
-
-function postToWorker(msg: PlayerInboundMessage, transfer: Transferable[] = []): void {
-  const w = worker;
-  if (!w) return;
-  try {
-    if (transfer.length > 0) w.postMessage(msg, transfer);
-    else w.postMessage(msg);
-  } catch (err) {
-    console.warn("[aero] failed to post message to worker", err);
+function reportEnvironment(): void {
+  const isolated = typeof window.crossOriginIsolated === "boolean" && window.crossOriginIsolated;
+  const shared = typeof SharedArrayBuffer !== "undefined";
+  if (isolated && shared) {
+    coiPill.dataset.state = "on";
+    coiText.textContent = "shared memory: on";
+  } else if (shared) {
+    coiPill.dataset.state = "loading";
+    coiText.textContent = "shared memory: waiting for isolation";
+  } else {
+    coiPill.dataset.state = "off";
+    coiText.textContent = "shared memory: off (copy transport)";
   }
 }
 
-function stopWorker(): void {
-  const w = worker;
+// --- presenter -------------------------------------------------------------
+
+function ensurePresenter(): VgaPresenter {
+  if (presenter) return presenter;
+  presenter = new VgaPresenter(canvas, {
+    scaleMode: "auto",
+    integerScaling: true,
+    maxPresentHz: 60,
+    clearColor: "#000000",
+  });
+  presenter.start();
+  return presenter;
+}
+
+// --- serial ----------------------------------------------------------------
+
+function appendSerial(text: string): void {
+  if (!text) return;
+  serialLog += text;
+  if (serialLog.length > SERIAL_LOG_LIMIT) serialLog = serialLog.slice(-SERIAL_LOG_LIMIT);
+  serialOut.textContent = serialLog;
+  serialOut.scrollTop = serialOut.scrollHeight;
+}
+
+// --- worker ----------------------------------------------------------------
+
+function postToWorker(message: PlayerInboundMessage, transfer: Transferable[] = []): void {
+  worker?.postMessage(message, transfer);
+}
+
+function teardownWorker(): void {
+  const current = worker;
   worker = null;
-  running = false;
-  paused = false;
-  if (!w) return;
+  if (!current) return;
   try {
-    w.postMessage({ type: "player.stop" } satisfies PlayerInboundMessage);
+    current.postMessage({ type: "player.stop" } satisfies PlayerInboundMessage);
   } catch {
-    /* ignore */
+    /* channel may already be closed */
   }
-  try {
-    w.terminate();
-  } catch {
-    /* ignore */
-  }
-  presenter.setSharedFramebuffer(null);
-  testState.transport = "none";
+  current.terminate();
 }
 
-function handleWorkerMessage(data: unknown): void {
+function handleMessage(data: unknown): void {
   if (!isPlayerOutboundMessage(data)) return;
 
-  switch (data.type) {
-    case "player.phase": {
-      setPhase(data.phase as Phase, data.detail);
-      if (data.phase === "starting" || data.phase === "booting") {
-        showOverlay({ title: "Powering on…", text: data.detail, spinner: true });
-      } else if (data.phase === "running") {
-        hideOverlay();
-        running = true;
-      } else if (data.phase === "error") {
-        showOverlay({ title: "The machine stopped", text: data.detail ?? "", spinner: false, error: true });
-      }
-      return;
-    }
-
-    case "player.ready": {
-      testState.ready = true;
-      testState.variant = data.variant;
-      testState.transport = data.transport;
-      metaVariant.textContent = data.variant;
-      metaTransport.textContent = data.transport === "shared" ? "shared memory" : "copied frames";
-      if (data.width > 0 && data.height > 0) {
-        metaDisplay.textContent = `${data.width} × ${data.height}`;
-      }
-      if (data.framebuffer && typeof SharedArrayBuffer !== "undefined") {
-        try {
-          presenter.setSharedFramebuffer(wrapSharedFramebuffer(data.framebuffer, 0));
-          metaTransport.textContent = "shared memory";
-        } catch (err) {
-          console.warn("[aero] shared framebuffer unusable, waiting for copies", err);
-          presenter.setSharedFramebuffer(null);
-          metaTransport.textContent = "copied frames";
-        }
-      } else {
-        presenter.setSharedFramebuffer(null);
-        metaTransport.textContent = "copied frames";
-      }
-      return;
-    }
-
-    case "player.frame": {
-      presenter.pushCopyFrame({
-        width: data.width,
-        height: data.height,
-        strideBytes: data.strideBytes,
-        format: FRAMEBUFFER_FORMAT_RGBA8888,
-        frameCounter: data.frameCounter,
-        pixelsU8: new Uint8Array(data.pixels),
-      });
-      testState.transportCopies += 1;
-      return;
-    }
-
-    case "player.serial": {
-      serialBuffer += data.text;
-      if (serialBuffer.length > SERIAL_LOG_LIMIT) serialBuffer = serialBuffer.slice(-SERIAL_LOG_LIMIT);
-      testState.serial = serialBuffer;
-      serialOut.textContent = serialBuffer;
-      serialOut.scrollTop = serialOut.scrollHeight;
-      return;
-    }
-
-    case "player.stats": {
-      testState.frames = data.frames;
-      testState.width = data.width;
-      testState.height = data.height;
-      metaFrames.textContent = String(data.frames);
-      metaIps.textContent = formatRate(data.instructionsPerSecond);
-      if (data.width > 0 && data.height > 0) {
-        metaDisplay.textContent = `${data.width} × ${data.height}`;
-      }
-      return;
-    }
-
-    case "player.error": {
-      testState.error = data.message;
-      setPhase("error");
+  if (data.type === "player.phase") {
+    setStatus(data.phase, data.detail);
+    if (data.phase === "running") hideOverlay();
+    if (data.phase === "error") {
+      testState.error = data.detail ?? "guest error";
       showOverlay({
-        title: "The emulator hit an error",
-        text: "This is almost always a missing or stale WASM bundle.",
-        detail: data.message,
+        title: "The guest stopped",
+        text: "Something went wrong while running the emulator.",
+        detail: data.detail,
         spinner: false,
         error: true,
       });
-      return;
     }
+    return;
+  }
 
-    default:
-      return;
+  if (data.type === "player.ready") {
+    testState.ready = true;
+    testState.variant = data.variant;
+    testState.transport = data.transport;
+    metaVariant.textContent = data.variant;
+    if (data.width > 0 && data.height > 0) {
+      metaDisplay.textContent = `${data.width} × ${data.height}`;
+      testState.width = data.width;
+      testState.height = data.height;
+    }
+    const p = ensurePresenter();
+    if (data.transport === "shared" && data.framebuffer) {
+      p.setSharedFramebuffer(wrapSharedFramebuffer(data.framebuffer, 0));
+      metaTransport.textContent = "shared";
+      coiPill.dataset.state = "on";
+      coiText.textContent = "shared memory: on";
+    } else {
+      p.setSharedFramebuffer(null);
+      metaTransport.textContent = "copy";
+    }
+    return;
+  }
+
+  if (data.type === "player.frame") {
+    testState.transportCopies += 1;
+    const p = ensurePresenter();
+    p.pushCopyFrame({
+      width: data.width,
+      height: data.height,
+      strideBytes: data.strideBytes,
+      format: FRAMEBUFFER_FORMAT_RGBA8888,
+      frameCounter: data.frameCounter,
+      pixelsU8: new Uint8Array(data.pixels),
+    });
+    return;
+  }
+
+  if (data.type === "player.serial") {
+    appendSerial(data.text);
+    testState.serial = serialLog;
+    return;
+  }
+
+  if (data.type === "player.stats") {
+    testState.frames = data.frames;
+    testState.width = data.width || testState.width;
+    testState.height = data.height || testState.height;
+    metaFrames.textContent = String(data.frames);
+    metaIps.textContent = formatRate(data.instructionsPerSecond);
+    if (data.width > 0 && data.height > 0) metaDisplay.textContent = `${data.width} × ${data.height}`;
+    return;
+  }
+
+  if (data.type === "player.error") {
+    testState.error = data.message;
+    setStatus("error", "worker error");
+    showOverlay({
+      title: "The emulator could not start",
+      text: "This usually means the WASM bundle is missing or stale. Rebuilding the site fixes it.",
+      detail: data.message,
+      spinner: false,
+      error: true,
+    });
   }
 }
 
-async function bootWith(disk: PlayerBootDisk | null, opts: { ramSizeBytes?: number } = {}): Promise<void> {
-  stopWorker();
-  hideBanner();
-  serialBuffer = "";
-  serialOut.textContent = "";
-  testState.serial = "";
-  testState.error = null;
-  testState.ready = false;
-  testState.frames = 0;
-  testState.transportCopies = 0;
+function startMachine(disk: PlayerBootDisk | null, ramSizeBytes: number): void {
+  teardownWorker();
+  bootGeneration += 1;
+  const generation = bootGeneration;
 
-  currentDisk = disk;
-  running = false;
   paused = false;
-  setPhase("starting");
-
-  const ramBytes = opts.ramSizeBytes ?? DEMO_RAM_BYTES;
-  metaRam.textContent = formatBytes(ramBytes);
+  btnPause.textContent = "Pause";
+  serialLog = "";
+  serialOut.textContent = "";
+  testState.ready = false;
+  testState.serial = "";
+  testState.frames = 0;
+  testState.error = null;
   metaFrames.textContent = "0";
   metaIps.textContent = "—";
-  metaTransport.textContent = "—";
+  metaRam.textContent = formatBytes(ramSizeBytes);
   metaVariant.textContent = "—";
+  metaTransport.textContent = "—";
+  lastBoot = { disk, ramSizeBytes };
 
-  const message: PlayerStartMessage = {
-    type: "player.start",
-    ramSizeBytes: ramBytes,
-    disk,
-    display: "vga",
-    input: inputMode,
-  };
+  showOverlay({ title: "Powering on…", text: "Instantiating the emulator core.", spinner: true });
+  setStatus("starting");
 
   const w = new Worker(new URL("../workers/player.worker.ts", import.meta.url), { type: "module" });
   worker = w;
-  let sawReady = false;
   w.addEventListener("message", (event: MessageEvent<unknown>) => {
-    if (worker !== w) return;
-    if (!sawReady && isPlayerOutboundMessage(event.data) && event.data.type === "player.ready") sawReady = true;
-    handleWorkerMessage(event.data);
-  });
-  w.addEventListener("messageerror", () => {
-    if (worker !== w) return;
-    testState.error = "worker message could not be deserialised";
-    showOverlay({ title: "Worker failure", text: testState.error, spinner: false, error: true });
+    if (generation !== bootGeneration) return;
+    handleMessage(event.data);
   });
   w.addEventListener("error", (event: ErrorEvent) => {
-    if (worker !== w) return;
-    const message = event.message || "worker crashed";
-    testState.error = message;
-    setPhase("error");
+    if (generation !== bootGeneration) return;
+    setStatus("error", "worker crashed");
     showOverlay({
-      title: "The emulator worker crashed",
-      text: "Reload the page. If it persists, the deployed WASM bundle may be stale.",
-      detail: formatOneLineError(message, 512),
+      title: "The emulator worker failed",
+      text: "The worker could not be loaded. If you are running from a file:// URL, serve the site over HTTP.",
+      detail: event.message || String(event.error ?? ""),
       spinner: false,
       error: true,
     });
   });
 
-  const transfer: Transferable[] = disk ? [disk.bytes] : [];
-  postToWorker(message, transfer);
-  presentSoon();
+  const message: PlayerStartMessage = {
+    type: "player.start",
+    ramSizeBytes,
+    disk,
+    display: "vga",
+    // Both paths by default: the INT 16h queue for BIOS-era guests (the demo
+    // disk, DOS) and the PS/2 controller for OSes that drive the keyboard
+    // themselves. `?input=ps2|bios` narrows it for debugging.
+    input: inputMode,
+  };
+  w.postMessage(message);
 }
 
-function presentSoon(): void {
-  presenter.start();
-}
-
-// --- boot media ------------------------------------------------------------
-
-function bootDemo(): void {
+function startDemo(): void {
   const sector = buildDemoBootSector();
-  void bootWith({ kind: "hdd", bytes: sector.buffer as ArrayBuffer, name: "aero-demo.img" });
+  const bytes = sector.buffer.slice(sector.byteOffset, sector.byteOffset + sector.byteLength) as ArrayBuffer;
+  setBanner("Booting the generated demo disk: 512 bytes of real-mode code.");
+  startMachine({ kind: "hdd", bytes, name: "demo-sector.bin" }, DEMO_RAM_BYTES);
 }
 
-function bootFirmwareOnly(): void {
-  void bootWith(null);
+function startFirmwareOnly(): void {
+  setBanner("No disk attached. The firmware will POST and then look for a boot device.");
+  startMachine(null, DEMO_RAM_BYTES);
 }
 
-async function bootFromFile(file: File): Promise<void> {
-  if (file.size === 0) {
-    showBanner("That file is empty.", "error");
+function startImage(bytes: ArrayBuffer, name: string): void {
+  if (bytes.byteLength === 0) {
+    setBanner(`${name} is empty.`, "error");
     return;
   }
-  if (file.size > MAX_INMEMORY_IMAGE_BYTES) {
-    showBanner(
-      `That image is ${formatBytes(file.size)}. The player keeps the whole image in guest memory, so it is capped at ${formatBytes(
-        MAX_INMEMORY_IMAGE_BYTES,
-      )}. Use the bring-up shell for larger media (streamed from OPFS).`,
+  if (bytes.byteLength > MAX_INMEMORY_IMAGE_BYTES) {
+    setBanner(
+      `${name} is ${formatBytes(bytes.byteLength)}; this page keeps images in guest memory and tops out at ` +
+        `${formatBytes(MAX_INMEMORY_IMAGE_BYTES)}. Use the bring-up shell for larger media.`,
       "error",
     );
     return;
   }
+  // 512-byte multiples only: the ATA model rejects anything else.
+  let image = bytes;
+  if (image.byteLength % 512 !== 0) {
+    const padded = new Uint8Array(Math.ceil(image.byteLength / 512) * 512);
+    padded.set(new Uint8Array(image));
+    image = padded.buffer;
+  }
+  const kind: "hdd" | "cd" = /\.(iso|cdr)(?:$|\?)/i.test(name) ? "cd" : "hdd";
+  setBanner(`Attached ${name} (${formatBytes(image.byteLength)}) as ${kind === "cd" ? "a CD-ROM" : "a hard disk"}.`);
+  startMachine({ kind, bytes: image, name }, IMAGE_RAM_BYTES);
+}
 
-  showBanner(`Reading ${file.name} (${formatBytes(file.size)})…`);
-  const bytes = await file.arrayBuffer();
-  const kind: PlayerBootDisk["kind"] = /\.iso$/i.test(file.name) ? "cd" : "hdd";
-  await bootWith({ kind, bytes, name: file.name });
-  showBanner(
-    kind === "cd"
-      ? `${file.name} attached as ATAPI CD-ROM; the firmware boots CD first while a disc is present.`
-      : `${file.name} attached as the primary ATA disk.`,
-  );
+async function loadFile(file: File): Promise<void> {
+  setBanner(`Reading ${file.name} (${formatBytes(file.size)})…`);
+  try {
+    const bytes = await file.arrayBuffer();
+    startImage(bytes, file.name);
+  } catch (err) {
+    setBanner(`Could not read ${file.name}: ${formatOneLineError(err, 200)}`, "error");
+  }
 }
 
 // --- input -----------------------------------------------------------------
 
-const BROWSER_OWNED_KEYS = new Set(["F5", "F11", "F12"]);
+/** Keys the browser must keep for itself. */
+const RESERVED_KEYS = new Set(["F5", "F11", "F12"]);
 
 function isTypingTarget(target: EventTarget | null): boolean {
   if (!(target instanceof HTMLElement)) return false;
@@ -413,29 +461,21 @@ function isTypingTarget(target: EventTarget | null): boolean {
   return tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || target.isContentEditable;
 }
 
-function reboot(): void {
-  if (currentDisk) void bootWith(currentDisk);
-  else bootFirmwareOnly();
+function inputAllowed(): boolean {
+  return phase === "running" || phase === "booting";
 }
 
 window.addEventListener("keydown", (event) => {
-  if (!running) return;
-  if (isTypingTarget(event.target)) return;
-
-  // Ctrl+Alt+Del is intercepted by the browser on many platforms, so offer the
-  // guest reset through an explicit chord instead.
+  if (!inputAllowed() || isTypingTarget(event.target)) return;
+  if (RESERVED_KEYS.has(event.code)) return;
+  // Leave browser shortcuts (Ctrl/Cmd) alone, except for the one chord that is
+  // conventionally "reboot the guest".
   if (event.ctrlKey && event.altKey && event.code === "Delete") {
     event.preventDefault();
     reboot();
     return;
   }
-
-  if (event.metaKey || event.ctrlKey) return; // leave browser shortcuts alone
-  if (BROWSER_OWNED_KEYS.has(event.code)) return;
-  if (event.repeat) {
-    event.preventDefault();
-    return;
-  }
+  if (event.ctrlKey || event.metaKey) return;
 
   postToWorker({ type: "player.key", code: event.code, pressed: true });
   testState.keysSent += 1;
@@ -443,155 +483,151 @@ window.addEventListener("keydown", (event) => {
 });
 
 window.addEventListener("keyup", (event) => {
-  if (!running) return;
-  if (isTypingTarget(event.target)) return;
-  if (event.metaKey || event.ctrlKey) {
-    if (event.code !== "ControlLeft" && event.code !== "ControlRight") return;
-  }
+  if (!inputAllowed() || isTypingTarget(event.target)) return;
+  if (event.ctrlKey || event.metaKey) return;
   postToWorker({ type: "player.key", code: event.code, pressed: false });
-  if (!BROWSER_OWNED_KEYS.has(event.code)) event.preventDefault();
+  if (!RESERVED_KEYS.has(event.code)) event.preventDefault();
 });
 
+// Release everything when the page loses focus, otherwise the guest keeps
+// believing a modifier is held down.
+window.addEventListener("blur", () => {
+  for (const code of ["ShiftLeft", "ShiftRight", "ControlLeft", "ControlRight", "AltLeft", "AltRight"]) {
+    postToWorker({ type: "player.key", code, pressed: false });
+  }
+});
+
+let pointerLocked = false;
+
 canvas.addEventListener("mousemove", (event) => {
-  if (!running) return;
+  if (!inputAllowed()) return;
   const dx = event.movementX | 0;
   const dy = event.movementY | 0;
   if (dx === 0 && dy === 0) return;
   postToWorker({ type: "player.mouseMotion", dx, dy, wheel: 0 });
 });
 
+canvas.addEventListener("mousedown", (event) => {
+  canvas.focus();
+  if (!inputAllowed()) return;
+  postToWorker({ type: "player.mouseButton", button: event.button, pressed: true });
+  if (!pointerLocked && event.button === 0) {
+    // Pointer lock makes relative motion usable (a DOS-era mouse has no
+    // absolute cursor); ignore failure, motion still works without it.
+    void canvas.requestPointerLock?.();
+  }
+});
+
+canvas.addEventListener("mouseup", (event) => {
+  if (!inputAllowed()) return;
+  postToWorker({ type: "player.mouseButton", button: event.button, pressed: false });
+});
+
+canvas.addEventListener("contextmenu", (event) => event.preventDefault());
+
 canvas.addEventListener("wheel", (event) => {
-  if (!running) return;
-  const wheel = -Math.sign(event.deltaY) | 0;
+  if (!inputAllowed()) return;
+  const wheel = Math.sign(event.deltaY) * -1;
   if (wheel === 0) return;
   postToWorker({ type: "player.mouseMotion", dx: 0, dy: 0, wheel });
   event.preventDefault();
 });
 
-canvas.addEventListener("mousedown", (event) => {
-  canvas.focus();
-  if (!running) return;
-  postToWorker({ type: "player.mouseButton", button: event.button | 0, pressed: true });
+document.addEventListener("pointerlockchange", () => {
+  pointerLocked = document.pointerLockElement === canvas;
 });
-
-window.addEventListener("mouseup", (event) => {
-  if (!running) return;
-  postToWorker({ type: "player.mouseButton", button: event.button | 0, pressed: false });
-});
-
-canvas.addEventListener("contextmenu", (event) => event.preventDefault());
-
-canvas.addEventListener("dblclick", () => {
-  const requestLock = (canvas as unknown as { requestPointerLock?: () => void }).requestPointerLock;
-  if (typeof requestLock !== "function") return;
-  try {
-    requestLock.call(canvas);
-  } catch {
-    /* ignore */
-  }
-});
-
-canvas.addEventListener("click", () => {
-  canvas.focus();
-  screen.classList.add("capture");
-  window.setTimeout(() => screen.classList.remove("capture"), 1200);
+document.addEventListener("pointerlockerror", () => {
+  pointerLocked = false;
 });
 
 // --- controls --------------------------------------------------------------
 
-btnReboot.addEventListener("click", () => reboot());
-btnPause.addEventListener("click", () => {
-  if (!running) return;
-  paused = !paused;
-  postToWorker({ type: "player.pause", paused });
-  setPhase(paused ? "paused" : "running");
-});
-btnFullscreen.addEventListener("click", () => {
-  if (document.fullscreenElement) void document.exitFullscreen();
-  else void screen.requestFullscreen?.();
-});
-btnBootDemo.addEventListener("click", () => bootDemo());
-btnBootFirmware.addEventListener("click", () => bootFirmwareOnly());
+function reboot(): void {
+  if (!lastBoot) {
+    startDemo();
+    return;
+  }
+  // The worker owns the machine; a fresh boot is both simpler and more honest
+  // than trying to reset a wedged guest in place.
+  startMachine(lastBoot.disk, lastBoot.ramSizeBytes);
+}
+
+btnBootDemo.addEventListener("click", () => startDemo());
+btnBootFirmware.addEventListener("click", () => startFirmwareOnly());
 btnBootFile.addEventListener("click", () => fileInput.click());
 fileInput.addEventListener("change", () => {
   const file = fileInput.files?.[0];
   fileInput.value = "";
-  if (file) void bootFromFile(file);
+  if (file) void loadFile(file);
 });
-btnResetCoi.addEventListener("click", () => {
+
+btnReboot.addEventListener("click", () => reboot());
+
+btnPause.addEventListener("click", () => {
+  if (!worker) return;
+  paused = !paused;
+  btnPause.textContent = paused ? "Resume" : "Pause";
+  postToWorker({ type: "player.pause", paused });
+});
+
+btnFullscreen.addEventListener("click", () => {
+  if (document.fullscreenElement) {
+    void document.exitFullscreen();
+    return;
+  }
+  void screen.requestFullscreen?.().catch((err: unknown) => {
+    setBanner(`Fullscreen was refused: ${formatOneLineError(err, 160)}`, "error");
+  });
+});
+
+btnResetCoi.addEventListener("click", async () => {
   try {
+    const registrations = await navigator.serviceWorker.getRegistrations();
+    await Promise.all(registrations.map((registration) => registration.unregister()));
+    for (const key of await caches.keys()) await caches.delete(key);
     sessionStorage.removeItem("aero.coiReloaded");
   } catch {
-    /* ignore */
+    /* best effort */
   }
-  const url = new URL(location.href);
-  url.searchParams.set("no-coi", "1");
-  location.href = url.href;
+  location.reload();
 });
 
-// --- environment readout ---------------------------------------------------
+// --- boot ------------------------------------------------------------------
 
-function reportEnvironment(): void {
-  const isolated = (globalThis as { crossOriginIsolated?: boolean }).crossOriginIsolated === true;
-  const hasSab = typeof SharedArrayBuffer !== "undefined";
-  const canShare = isolated && hasSab;
-  coiPill.dataset.state = canShare ? "running" : "idle";
-  coiText.textContent = canShare
-    ? "shared memory: on"
-    : hasSab
-      ? "shared memory: not isolated"
-      : "shared memory: unavailable";
-  coiPill.title = canShare
-    ? "Cross-origin isolated: the emulator publishes frames through SharedArrayBuffer."
-    : "Not cross-origin isolated: the isolation service worker may still be installing, or this browser blocks it. Frames are copied instead.";
-}
+window.addEventListener("unhandledrejection", (event) => {
+  console.error("[aero] unhandled rejection", event.reason);
+});
 
-// --- start -----------------------------------------------------------------
-
-window.__aeroPlayer = testState;
-presenter.start();
 reportEnvironment();
-setPhase("idle");
+ensurePresenter();
 
-const params = new URLSearchParams(location.search);
-const autoBoot = params.get("noboot") !== "1" && params.get("noboot") !== "true";
-
-// `?input=ps2|bios|both` selects how keystrokes reach the guest. The default
-// feeds both the INT 16h queue (DOS-era guests) and the PS/2 controller
-// (OSes with their own keyboard driver); `ps2` is useful to isolate a broken
-// PS/2 path and `bios` to isolate the BIOS one.
-const requestedInput = params.get("input");
-const inputMode: PlayerInputMode =
-  requestedInput === "ps2" || requestedInput === "bios" || requestedInput === "both"
-    ? requestedInput
-    : "both";
-testState.inputMode = inputMode;
-
-// `?disk=<url>` boots a same-site image directly, which is handy for sharing a
-// link to a specific guest without re-implementing the UI.
-const diskParam = params.get("disk");
-if (diskParam) {
-  showBanner(`Loading ${diskParam}…`);
-  void (async () => {
-    try {
-      const response = await fetch(diskParam);
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      const bytes = await response.arrayBuffer();
-      if (bytes.byteLength > MAX_INMEMORY_IMAGE_BYTES) throw new Error(`image is ${formatBytes(bytes.byteLength)} (max ${formatBytes(MAX_INMEMORY_IMAGE_BYTES)})`);
-      await bootWith({ kind: /\.iso(?:$|\?)/i.test(diskParam) ? "cd" : "hdd", bytes, name: diskParam });
-      showBanner(`${diskParam} attached.`);
-    } catch (err) {
-      showBanner(`Could not load ${diskParam}: ${formatOneLineError(err, 300)}`, "error");
-    }
-  })();
-} else if (autoBoot) {
-  bootDemo();
+if (new URLSearchParams(location.search).get("noboot") === "1") {
+  showOverlay({ title: "Ready", text: "Pick a boot medium to start the machine.", spinner: false });
+  setStatus("idle");
+  setBanner("Nothing booted yet.");
 } else {
-  setPhase("stopped");
-  showOverlay({
-    title: "Ready",
-    text: "Pick a boot medium on the right, or press Reboot to start the demo disk.",
-    spinner: false,
-  });
+  try {
+    startDemo();
+  } catch (err) {
+    setStatus("error", "boot failed");
+    showOverlay({
+      title: "Could not boot the demo disk",
+      detail: formatOneLineError(err, 500),
+      spinner: false,
+      error: true,
+    });
+  }
 }
 
+// Expose live state for debugging and for the headless smoke test. The page
+// itself never reads it.
+declare global {
+  interface Window {
+    __aeroPlayer?: PlayerTestState;
+  }
+}
+
+testState.inputMode = inputMode;
+window.__aeroPlayer = testState;
+
+export {};
