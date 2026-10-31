@@ -74,14 +74,31 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Build WASM packages (single-threaded)
-        run: pnpm -C apps/web run wasm:build:single -- --packages core,gpu
+        run: |
+          set -o pipefail
+          mkdir -p build-logs
+          pnpm -C apps/web run wasm:build:single -- --packages core,gpu 2>&1 \
+            | tee build-logs/wasm-single.log || bash scripts/ci/emit-failure-annotations.sh build-logs/wasm-single.log
         env:
           AERO_WASM_PACKAGES: core,gpu
 
       - name: Build WASM packages (threaded / shared memory)
-        run: pnpm -C apps/web run wasm:build:threaded -- --packages core,gpu
+        run: |
+          set -o pipefail
+          mkdir -p build-logs
+          pnpm -C apps/web run wasm:build:threaded -- --packages core,gpu 2>&1 \
+            | tee build-logs/wasm-threaded.log || bash scripts/ci/emit-failure-annotations.sh build-logs/wasm-threaded.log
         env:
           AERO_WASM_PACKAGES: core,gpu
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: build-logs
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Report WASM sizes
         run: |
