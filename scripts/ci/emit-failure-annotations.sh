@@ -15,7 +15,7 @@ MAX_LINES="${2:-40}"
 
 if [[ -z "${LOG_FILE}" || ! -f "${LOG_FILE}" ]]; then
   echo "::error::build failed (no log captured at '${LOG_FILE:-<unset>}')"
-  exit 0
+  exit 1
 fi
 
 # Collapse CR, strip ANSI escapes, and keep lines that look like diagnostics.
@@ -40,4 +40,4 @@ for line in "${LINES[@]}"; do
 done
 
 echo "::error::(full log captured as an artifact: build-logs)"
-exit 0
+exit 1
