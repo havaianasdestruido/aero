@@ -1,0 +1,166 @@
+name: Build and deploy (GitHub Pages)
+
+# Builds the Rust -> WASM emulator core, the browser host, and publishes the
+# whole thing as a static site to GitHub Pages.
+#
+# Everything the page needs at runtime is pre-built here: no build tooling is
+# required from the visitor, and no server code is involved.
+
+on:
+  push:
+    branches:
+      - main
+      - "arena/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Node 24 is required by the repo (see .nvmrc / package.json engines).
+  NODE_VERSION: "24.18.0"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  wasm:
+    name: Build WASM (threaded + single)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchains
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.92.0 --profile minimal --target wasm32-unknown-unknown
+          rustup toolchain install nightly-2025-12-08 --profile minimal --target wasm32-unknown-unknown
+          rustup component add rust-src --toolchain nightly-2025-12-08
+          rustup target add wasm32-unknown-unknown --toolchain 1.92.0
+          rustup default 1.92.0
+          rustc --version
+          cargo --version
+
+      - name: Cache cargo registry + build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: wasm-cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            wasm-cargo-${{ runner.os }}-
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Setup pnpm
+        run: |
+          set -euo pipefail
+          corepack enable
+          corepack prepare pnpm@11.5.0 --activate
+          pnpm --version
+
+      - name: Install JS dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build WASM packages (single-threaded)
+        run: pnpm -C apps/web run wasm:build:single -- --packages core,gpu
+        env:
+          AERO_WASM_PACKAGES: core,gpu
+
+      - name: Build WASM packages (threaded / shared memory)
+        run: pnpm -C apps/web run wasm:build:threaded -- --packages core,gpu
+        env:
+          AERO_WASM_PACKAGES: core,gpu
+
+      - name: Report WASM sizes
+        run: |
+          set -euo pipefail
+          du -sh apps/web/src/wasm/pkg-* || true
+
+      - name: Upload WASM packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: wasm-packages
+          path: apps/web/src/wasm/pkg-*
+          if-no-files-found: error
+          retention-days: 7
+
+  web:
+    name: Build site
+    needs: wasm
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Setup pnpm
+        run: |
+          set -euo pipefail
+          corepack enable
+          corepack prepare pnpm@11.5.0 --activate
+          pnpm --version
+
+      - name: Install JS dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Download WASM packages
+        uses: actions/download-artifact@v4
+        with:
+          name: wasm-packages
+          path: apps/web/src/wasm
+
+      - name: Fetch demo media
+        run: bash scripts/ci/fetch-demo-media.sh
+
+      - name: Build static site
+        run: pnpm run build
+        env:
+          # Served from https://<owner>.github.io/<repo>/
+          VITE_BASE: /${{ github.event.repository.name }}/
+          GIT_SHA: ${{ github.sha }}
+          AERO_VERSION: ${{ github.ref_name }}
+
+      - name: Show output
+        run: |
+          set -euo pipefail
+          du -sh dist
+          find dist -maxdepth 2 -type f | head -50
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+  deploy:
+    name: Deploy to GitHub Pages
+    needs: web
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+        with:
+          enablement: true
+
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v4

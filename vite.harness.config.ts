@@ -187,7 +187,18 @@ function persistentCacheShimPlugin(): Plugin {
   };
 }
 
+// The deployed static site may live under a sub-path (GitHub Pages project
+// sites are served from `https://<owner>.github.io/<repo>/`). `VITE_BASE` lets
+// the deploy workflow inject that prefix; the default keeps local dev at `/`.
+const basePath = (() => {
+  const raw = (process.env.VITE_BASE ?? '/').trim();
+  if (!raw) return '/';
+  if (raw === './' || raw.startsWith('/')) return raw.endsWith('/') ? raw : `${raw}/`;
+  return `/${raw.replace(/^\/+/, '').replace(/\/+$/, '')}/`;
+})();
+
 export default defineConfig({
+  base: basePath,
   assetsInclude: ['**/*.wasm'],
   build: {
     // Ensure `.wasm` is always emitted as a file so `fetch()`/`instantiateStreaming()`
