@@ -1,0 +1,276 @@
+name: Build and deploy (GitHub Pages)
+
+# Builds the Rust -> WASM emulator core, the browser host, and publishes the
+# whole thing as a static site to GitHub Pages.
+#
+# Everything the page needs at runtime is pre-built here: no build tooling is
+# required from the visitor, and no server code is involved.
+
+on:
+  push:
+    branches:
+      - main
+      - "arena/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Node 24 is required by the repo (see .nvmrc / package.json engines).
+  NODE_VERSION: "24.18.0"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  wasm:
+    name: Build WASM (threaded + single)
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchains
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.92.0 --profile minimal --target wasm32-unknown-unknown
+          rustup toolchain install nightly-2025-12-08 --profile minimal --target wasm32-unknown-unknown
+          rustup component add rust-src --toolchain nightly-2025-12-08
+          rustup default 1.92.0
+          rustc --version
+          cargo --version
+
+      - name: Cache cargo registry + build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: wasm-cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            wasm-cargo-${{ runner.os }}-
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Setup pnpm
+        run: |
+          set -euo pipefail
+          corepack enable
+          corepack prepare pnpm@11.5.0 --activate
+          pnpm --version
+
+      - name: Install JS dependencies
+        run: |
+          set -o pipefail
+          mkdir -p build-logs
+          pnpm install --frozen-lockfile 2>&1 | tee build-logs/install.log \
+            || bash scripts/ci/emit-failure-annotations.sh build-logs/install.log
+
+      - name: Show tooling
+        run: |
+          set -euo pipefail
+          pnpm exec wasm-pack --version
+
+      - name: Build WASM packages (single-threaded)
+        run: |
+          set -o pipefail
+          pnpm exec node apps/web/scripts/build_wasm.mjs single release --packages core,gpu 2>&1 \
+            | tee build-logs/wasm-single.log \
+            || bash scripts/ci/emit-failure-annotations.sh build-logs/wasm-single.log
+
+      - name: Build WASM packages (threaded / shared memory)
+        run: |
+          set -o pipefail
+          pnpm exec node apps/web/scripts/build_wasm.mjs threaded release --packages core,gpu 2>&1 \
+            | tee build-logs/wasm-threaded.log \
+            || bash scripts/ci/emit-failure-annotations.sh build-logs/wasm-threaded.log
+
+      - name: Report WASM sizes
+        run: |
+          set -euo pipefail
+          du -sh apps/web/src/wasm/pkg-* || true
+
+      - name: Upload WASM packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: wasm-packages
+          path: apps/web/src/wasm/pkg-*
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wasm-build-logs
+          path: build-logs
+          if-no-files-found: ignore
+          retention-days: 7
+
+  web:
+    name: Build site
+    needs: wasm
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Setup pnpm
+        run: |
+          set -euo pipefail
+          corepack enable
+          corepack prepare pnpm@11.5.0 --activate
+          pnpm --version
+
+      - name: Install JS dependencies
+        run: |
+          set -o pipefail
+          mkdir -p build-logs
+          pnpm install --frozen-lockfile 2>&1 | tee build-logs/install-web.log \
+            || bash scripts/ci/emit-failure-annotations.sh build-logs/install-web.log
+
+      - name: Download WASM packages
+        uses: actions/download-artifact@v4
+        with:
+          name: wasm-packages
+          path: apps/web/src/wasm
+
+      # No external demo media is fetched: the machine has no floppy controller,
+      # and a raw FreeDOS floppy image attached as a hard disk cannot boot (the
+      # guest's CHS geometry assume 18 sectors/track). The player ships a
+      # generated boot sector instead — instant, offline, and always bootable —
+      # and visitors can mount their own IMG/ISO. `scripts/ci/fetch-demo-media.sh`
+      # is kept for hosts that do implement a floppy controller.
+
+      - name: Build static site
+        run: |
+          set -o pipefail
+          pnpm run build 2>&1 | tee build-logs/build-web.log \
+            || bash scripts/ci/emit-failure-annotations.sh build-logs/build-web.log
+        env:
+          # Served from https://<owner>.github.io/<repo>/
+          VITE_BASE: /${{ github.event.repository.name }}/
+          GIT_SHA: ${{ github.sha }}
+          AERO_VERSION: ${{ github.ref_name }}
+
+      - name: Install Playwright Chromium
+        run: |
+          set -euo pipefail
+          pnpm exec playwright install --with-deps chromium
+
+      # Boots the *built* artifact in headless Chromium and asserts the guest
+      # comes up: ready state, frames presented, the bundled demo boot sector
+      # announcing itself on COM1, non-black pixels on the canvas, and a repaint
+      # after keystrokes. Non-blocking for the deploy so a flaky headless runner
+      # cannot keep the site offline, but a failure is surfaced as an annotation
+      # (and in build-logs/player-smoke-report.json) instead of being swallowed.
+      - name: Smoke test the built player
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          node scripts/ci/player-smoke.mjs 2>&1 | tee build-logs/player-smoke.log
+        env:
+          AERO_SMOKE_PORT: "8123"
+          AERO_SMOKE_REPORT: build-logs/player-smoke-report.json
+          AERO_SMOKE_SCREENSHOT: build-logs/player-smoke.png
+
+      - name: Show output
+        run: |
+          set -euo pipefail
+          du -sh dist
+          find dist -maxdepth 2 -type f | head -50
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-build-logs
+          path: build-logs
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+  deploy:
+    name: Deploy to GitHub Pages
+    needs: web
+    runs-on: ubuntu-latest
+    # Only the default branch may publish. The `github-pages` environment's
+    # deployment branch policy allows `main` alone, so a run from any other
+    # branch would fail at the deploy step with an environment-protection error
+    # that looks like a bug. Branches still build and smoke-test the artifact;
+    # publishing happens when the work lands on `main`.
+    #
+    # To preview a branch instead, add it under Settings -> Environments ->
+    # github-pages -> Deployment branches, then relax this condition (or
+    # dispatch this workflow from that branch).
+    if: github.ref_name == github.event.repository.default_branch
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      # Failing here with a raw `HttpError: Resource not accessible by
+      # integration` is the single most confusing failure this pipeline can
+      # produce, so state the actual cause and the one-time fix up front.
+      - name: Check whether Pages is enabled
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          status=$(curl -sS -o /dev/null -w '%{http_code}' \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/pages" || echo 000)
+          echo "Pages API status: ${status}"
+          case "${status}" in
+            200)
+              echo "Pages is enabled for ${GITHUB_REPOSITORY}." ;;
+            404)
+              {
+                echo "### GitHub Pages is not enabled for this repository (one-time setup)"
+                echo
+                echo "This run built the site successfully, but GitHub refuses to publish it"
+                echo "because the repository has no Pages site yet, and the workflow token"
+                echo "cannot create one."
+                echo
+                echo "1. Open <https://github.com/${GITHUB_REPOSITORY}/settings/pages>"
+                echo "2. Set **Source** to **GitHub Actions**."
+                echo "3. Re-run this job (Actions → this run → *Re-run failed jobs*)."
+                echo
+                echo "After that, every push publishes automatically; nothing else is required."
+              } >> "$GITHUB_STEP_SUMMARY"
+              echo "::error title=GitHub Pages is not enabled::Enable it once at https://github.com/${GITHUB_REPOSITORY}/settings/pages (Source: GitHub Actions), then re-run the deploy job."
+              echo "pages_enabled=false" >> "$GITHUB_OUTPUT" ;;
+            *)
+              echo "::warning title=Could not determine Pages status::The Pages API returned ${status}; continuing anyway."
+              echo "pages_enabled=unknown" >> "$GITHUB_OUTPUT" ;;
+          esac
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+        with:
+          enablement: true
+
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v4

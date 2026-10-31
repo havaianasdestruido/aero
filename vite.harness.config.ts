@@ -187,7 +187,18 @@ function persistentCacheShimPlugin(): Plugin {
   };
 }
 
+// The deployed static site may live under a sub-path (GitHub Pages project
+// sites are served from `https://<owner>.github.io/<repo>/`). `VITE_BASE` lets
+// the deploy workflow inject that prefix; the default keeps local dev at `/`.
+const basePath = (() => {
+  const raw = (process.env.VITE_BASE ?? '/').trim();
+  if (!raw) return '/';
+  if (raw === './' || raw.startsWith('/')) return raw.endsWith('/') ? raw : `${raw}/`;
+  return `/${raw.replace(/^\/+/, '').replace(/\/+$/, '')}/`;
+})();
+
 export default defineConfig({
+  base: basePath,
   assetsInclude: ['**/*.wasm'],
   build: {
     // Ensure `.wasm` is always emitted as a file so `fetch()`/`instantiateStreaming()`
@@ -197,6 +208,8 @@ export default defineConfig({
       // The harness preview server (port 4173) is used for COOP/COEP + CSP matrix tests.
       // Both application entry points are built so the matrix covers each of them.
       input: {
+        // The public player page (what the deployed static site serves at `/`).
+        player: fileURLToPath(new URL('./index.html', import.meta.url)),
         main: fileURLToPath(new URL('./apps/web/index.html', import.meta.url)),
         // The fuller shell used for manual Windows 7 bring-up.
         bringup: fileURLToPath(new URL('./apps/web/bringup.html', import.meta.url)),

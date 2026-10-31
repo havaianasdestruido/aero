@@ -291,3 +291,6 @@ perf.data.old
 # Built by tools/qemu-trace-plugin/Makefile from aero_trace.c; it embeds the
 # absolute build path, so it is per-machine as well as regenerable.
 tools/qemu-trace-plugin/aero_trace.so
+
+# Build-time fetched demo media (see scripts/ci/fetch-demo-media.sh); never committed.
+apps/web/public/demo/

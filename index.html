@@ -1,0 +1,172 @@
+<!doctype html>
+<!--
+  Aero — the public player page.
+
+  This is the page the static site (GitHub Pages) serves at its root: a complete
+  x86 personal computer emulated in WebAssembly, with the guest display on a
+  canvas and the guest keyboard wired to the browser's.
+
+  Everything below is static: the emulator core is compiled to WASM at build
+  time (see .github/workflows/pages.yml), and the boot media are either generated
+  in-page or fetched from `demo/`. No server-side code is involved.
+
+  Related pages that ship in the same artifact:
+  - /apps/web/bringup.html   the low-level bring-up shell (mount big disk images,
+                             inspect devices, watch serial/logs)
+  - /apps/web/index.html     the capability harness CI drives
+-->
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Aero — an x86 PC in your browser</title>
+    <meta
+      name="description"
+      content="Aero is a Windows 7-capable x86 system emulator written in Rust and compiled to WebAssembly. Boot a demo disk, load your own image, and watch a real BIOS, VGA and keyboard come up inside the page."
+    />
+    <meta name="color-scheme" content="dark" />
+    <script>
+      /*
+       * Cross-origin isolation shim.
+       *
+       * Static hosts (GitHub Pages included) cannot send COOP/COEP headers, and
+       * without them `SharedArrayBuffer` is unavailable. The service worker in
+       * /coi-serviceworker.js re-issues our same-origin responses with those
+       * headers so the emulator can publish frames through shared memory.
+       *
+       * This is strictly an optimisation: if it fails, the player falls back to
+       * copying frames over postMessage and still boots.
+       */
+      (function crossOriginIsolationShim() {
+        var params = new URLSearchParams(location.search);
+        var optedOut = params.get("no-coi") === "1" || params.get("no-coi") === "true";
+        if (optedOut) return;
+        if (typeof window.crossOriginIsolated === "boolean" && window.crossOriginIsolated === true) return;
+        if (!("serviceWorker" in navigator)) return;
+        if (!window.isSecureContext) return;
+
+        var RELOAD_FLAG = "aero.coiReloaded";
+        navigator.serviceWorker.addEventListener("controllerchange", function () {
+          if (sessionStorage.getItem(RELOAD_FLAG) === "1") return;
+          try {
+            sessionStorage.setItem(RELOAD_FLAG, "1");
+          } catch (_) {
+            /* private mode: reload anyway, guarded by the sessionStorage read above */
+          }
+          location.reload();
+        });
+
+        navigator.serviceWorker
+          .register(new URL("coi-serviceworker.js", location.href).href, { scope: "./" })
+          .catch(function (err) {
+            console.warn("[aero] cross-origin isolation shim unavailable:", err);
+          });
+      })();
+    </script>
+  </head>
+  <body>
+    <header class="app-header">
+      <div class="brand">
+        <h1>AERO</h1>
+        <span class="tagline">an x86 PC, emulated in WebAssembly</span>
+      </div>
+      <div class="header-spacer"></div>
+      <div class="pill" id="status-pill" data-state="idle">
+        <span class="dot"></span>
+        <span id="status-text">starting…</span>
+      </div>
+      <div class="pill" id="coi-pill" title="Cross-origin isolation enables zero-copy frame sharing">
+        <span class="dot"></span>
+        <span id="coi-text">shared memory: detecting…</span>
+      </div>
+    </header>
+
+    <main class="app-main">
+      <section>
+        <div class="screen" id="screen">
+          <canvas id="vm-canvas" tabindex="0" aria-label="Emulated display"></canvas>
+          <div class="screen-overlay" id="screen-overlay">
+            <div class="spinner" id="overlay-spinner"></div>
+            <h2 id="overlay-title">Powering on…</h2>
+            <p id="overlay-text">Loading the emulator core.</p>
+            <pre class="detail" id="overlay-detail"></pre>
+          </div>
+        </div>
+
+        <div class="controls">
+          <button class="primary" id="btn-reboot" type="button">Reboot</button>
+          <button id="btn-pause" type="button">Pause</button>
+          <button id="btn-fullscreen" type="button">Fullscreen</button>
+          <button id="btn-reset-coi" type="button" class="ghost" title="Clear the isolation shim and reload">
+            Reload clean
+          </button>
+        </div>
+      </section>
+
+      <aside class="sidebar">
+        <div class="panel">
+          <h3>Boot medium</h3>
+          <div class="boot-options">
+            <button class="boot-option" type="button" id="boot-demo">
+              <span class="name">Aero demo disk</span>
+              <span class="sub">Generated 512-byte boot sector · instant, offline</span>
+            </button>
+            <button class="boot-option" type="button" id="boot-file">
+              <span class="name">Load a disk image…</span>
+              <span class="sub">IMG/ISO up to 128 MB, stays on your machine</span>
+            </button>
+            <button class="boot-option" type="button" id="boot-firmware">
+              <span class="name">Firmware POST only</span>
+              <span class="sub">No disk attached · watch the BIOS initialise</span>
+            </button>
+          </div>
+          <input class="file-input" id="file-input" type="file" accept=".img,.iso,.ima,.bin,.raw" />
+          <div class="banner" id="boot-banner" hidden></div>
+        </div>
+
+        <div class="panel">
+          <h3>Machine</h3>
+          <dl class="meta-list">
+            <dt>WASM core</dt>
+            <dd id="meta-variant">—</dd>
+            <dt>Display</dt>
+            <dd id="meta-display">—</dd>
+            <dt>Frames</dt>
+            <dd id="meta-frames">0</dd>
+            <dt>Speed</dt>
+            <dd id="meta-ips">—</dd>
+            <dt>Guest RAM</dt>
+            <dd id="meta-ram">—</dd>
+            <dt>Framebuffer</dt>
+            <dd id="meta-transport">—</dd>
+          </dl>
+        </div>
+
+        <div class="panel serial-panel">
+          <h3>COM1 serial</h3>
+          <pre id="serial-out"></pre>
+        </div>
+
+        <div class="panel notes">
+          <h3>Using it</h3>
+          <ul>
+            <li>Click the screen, then type. Keystrokes go through an emulated 8042 controller.</li>
+            <li><kbd>Esc</kbd> clears the demo's screen; <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>Del</kbd> reboots the guest.</li>
+            <li>Mouse motion is forwarded to the guest PS/2 mouse.</li>
+            <li>
+              Larger images (a Windows 7 ISO, an installed disk) work too, but need streaming storage: use the
+              <a href="apps/web/bringup.html">bring-up shell</a>.
+            </li>
+          </ul>
+        </div>
+      </aside>
+    </main>
+
+    <footer>
+      Rust → WebAssembly, no server round-trips. Emulator source:
+      <a href="https://github.com/havaianasdestruido/aero">github.com/havaianasdestruido/aero</a>.
+    </footer>
+
+    <script type="module" src="./apps/web/src/player/player_app.ts"></script>
+  </body>
+</html>
