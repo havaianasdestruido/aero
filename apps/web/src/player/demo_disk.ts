@@ -46,9 +46,9 @@ type ScreenLine = { readonly row: number; readonly col: number; readonly attr: n
 const BANNER: readonly ScreenLine[] = [
   { row: 1, col: 2, attr: ATTR_BRIGHT_WHITE_ON_BLUE, text: "****  AERO EMULATOR  ****" },
   { row: 2, col: 2, attr: 0x1e, text: "A real x86 PC in your browser." },
-  { row: 3, col: 2, attr: 0x1e, text: "BIOS, VGA and keyboard: emulated." },
-  { row: 5, col: 2, attr: ATTR_GREY_ON_BLACK, text: "This boot sector is the whole OS." },
-  { row: 7, col: 2, attr: 0x1a, text: "Type below. Esc clears the screen." },
+  { row: 3, col: 2, attr: 0x1e, text: "BIOS, VGA, keyboard: emulated." },
+  { row: 5, col: 2, attr: ATTR_GREY_ON_BLACK, text: "This boot sector is the OS." },
+  { row: 7, col: 2, attr: 0x1a, text: "Type below. Esc clears." },
 ];
 
 type Patch = { readonly kind: "rel8" | "rel16" | "addr16"; readonly at: number; readonly label: string };
@@ -347,6 +347,11 @@ export function buildDemoBootSector(): Uint8Array {
   // goes wrong.
   asm.movSiLabel("serial_banner").call("puts_serial");
 
+  // Progress markers on COM1. Two bytes of output that make a headless run
+  // self-diagnosing: `12` means video and the drawing loop both ran and the
+  // guest is about to poll INT 16h.
+  asm.movAlImm8(0x31).call("putc_serial"); // '1'
+
   // --- banner ------------------------------------------------------------
   asm.movReg16("ax", VIDEO_SEGMENT).movEsAx();
   for (const line of BANNER) {
@@ -365,6 +370,8 @@ export function buildDemoBootSector(): Uint8Array {
     .call("puts_video")
     .movReg16("bx", CURSOR_START)
     .movMemBx(VAR_CURSOR);
+
+  asm.movAlImm8(0x32).call("putc_serial"); // '2'
 
   // --- keyboard loop -----------------------------------------------------
   asm.label("key_loop").xorAhAh().int(0x16); // blocking read: AL=ASCII, AH=scancode

@@ -119,6 +119,7 @@ const testState: PlayerTestState = {
   transportCopies: 0,
   keysSent: 0,
   inputMode: "bios",
+  ips: 0,
 };
 
 /** See {@link testState}. */
@@ -135,6 +136,8 @@ type PlayerTestState = {
   transportCopies: number;
   keysSent: number;
   inputMode: PlayerInputMode;
+  /** Last reported guest speed, in instructions/second. */
+  ips: number;
 };
 
 // --- chrome ----------------------------------------------------------------
@@ -329,6 +332,7 @@ function handleMessage(data: unknown): void {
 
   if (data.type === "player.stats") {
     testState.frames = data.frames;
+    testState.ips = data.instructionsPerSecond;
     testState.width = data.width || testState.width;
     testState.height = data.height || testState.height;
     metaFrames.textContent = String(data.frames);

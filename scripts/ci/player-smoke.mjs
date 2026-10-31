@@ -241,7 +241,14 @@ async function main() {
 
     const before = await page.evaluate(SAMPLE_SCREEN);
     if (!before) fail("canvas", "no canvas");
-    report.steps.screen = { ok: before.nonBlack > 500, nonBlack: before.nonBlack, bright: before.bright, width: before.width, height: before.height };
+    report.steps.screen = {
+      ok: before.nonBlack > 500,
+      nonBlack: before.nonBlack,
+      bright: before.bright,
+      width: before.width,
+      height: before.height,
+      sketch: before.lines,
+    };
     if (before.nonBlack <= 500) fail("screen", `canvas is (nearly) black: ${before.nonBlack} non-black pixels`);
 
     // Keyboard path, end to end: the demo echoes every accepted character to
@@ -254,10 +261,12 @@ async function main() {
     await page.waitForTimeout(1_500);
 
     const after = await page.evaluate(SAMPLE_SCREEN);
+    if (after) report.screenSketch = after.lines;
     const state = await page.evaluate(() => ({
       serial: window.__aeroPlayer.serial ?? "",
       keysSent: window.__aeroPlayer.keysSent ?? 0,
       frames: window.__aeroPlayer.frames ?? 0,
+      ips: window.__aeroPlayer.ips ?? 0,
       inputMode: window.__aeroPlayer.inputMode,
     }));
 
@@ -269,6 +278,7 @@ async function main() {
       repainted,
       inputMode: state.inputMode,
       keysForwarded: state.keysSent - beforeKeys,
+      instructionsPerSecond: state.ips,
       framesBefore: beforeFrames,
       framesAfter: state.frames,
       checksumBefore: before.checksum,
@@ -277,11 +287,10 @@ async function main() {
         ? "guest echoed the typed text on COM1"
         : repainted
           ? "guest repainted, but nothing reached COM1"
-          : `keys=${state.keysSent - beforeKeys}; serial=${JSON.stringify(state.serial.slice(-120))}`,
+          : `keys=${state.keysSent - beforeKeys} ips=${state.ips} serial=${JSON.stringify(state.serial.slice(-160))}`,
     };
     if (!report.steps.keyboard.ok) fail("keyboard", report.steps.keyboard.detail);
 
-    report.screenSketch = after.lines;
     report.pass = true;
   } catch (err) {
     report.error = String(err && err.message ? err.message : err);
@@ -333,7 +342,8 @@ async function main() {
     }
     if (report.error) annotate("error", "player smoke: failure", report.error.slice(0, 1500));
     for (const line of report.consoleLines.slice(-10)) annotate("error", "player console", line.slice(0, 500));
-    if (report.screenSketch) annotate("error", "player screen", sketchSummary(report.screenSketch));
+    const sketch = report.screenSketch ?? report.steps.screen?.sketch;
+    if (sketch) annotate("error", "player screen", sketchSummary(sketch));
     if (report.consoleLines.length) {
       console.log("=== console ===");
       for (const line of report.consoleLines) console.log(line);
