@@ -169,10 +169,21 @@ jobs:
           GIT_SHA: ${{ github.sha }}
           AERO_VERSION: ${{ github.ref_name }}
 
+      # `--with-deps` runs a full apt-get cycle on every run (several minutes,
+      # and it has stalled indefinitely on this runner image). The hosted
+      # runner already ships Chromium's shared libraries, so install the browser
+      # alone and cache it; the download is then skipped on later runs.
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}
+
       - name: Install Playwright Chromium
+        timeout-minutes: 10
         run: |
           set -euo pipefail
-          pnpm exec playwright install --with-deps chromium
+          pnpm exec playwright install chromium
 
       # Boots the *built* artifact in headless Chromium and asserts the guest
       # comes up: ready state, frames presented, the bundled demo boot sector
